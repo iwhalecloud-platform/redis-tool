@@ -1,0 +1,1805 @@
+#! /bin/bash
+#
+# redis cluster daily maintenance tool
+
+
+#################################### global ###################################
+readonly USAGE="Usage: $(basename $0) [OPTIONS] [command]
+OPTIONS:
+   -h <IP>:       Redis hostname (default: 127.0.0.1).
+   -p <port>:     Redis port (default: 6379).
+   -a <password>: Password to use when connecting to redis.
+                  You can also use the REDISCLI_AUTH environment
+                  variable to pass this password more safely.
+   -c <count>:    1. Rolling times for command statistics (default is inf, used by 'moni').
+                  2. Get slowlog number from each node (default: 100, used by 'slowlog').
+                  3. Get key number from the node (default: 100000, used by 'keys').
+   -d <delay>:    Waits <delay> seconds for monitor (default: 3, used by 'moni').
+   -t <time>:     The running time(s) on trace (default: 10, used by 'trace').
+   -s:            Process the specify node only (used by 'moni' & 'slowlog').
+   -l:            Show average latency for TOP10 commands (used by 'moni').
+   -f <file>:     1. Monitor file name to load (used by 'trace').
+                  2. Keys file name to statistics (used by 'keys').
+   -L <level>:    Key prefix level (default: 3, usede by 'keys').
+   -H:            Analyze the hot keys when use option '-f' (used by 'trace').
+   -C:            Stat commands by cient host when use option '-f' (used by 'trace').
+   -r:            Output raw data of cluster nodes (used by 'nodes').
+   -k <key>:      Config name to get/set (used by 'config').
+   -v <value>:    Config value to set (used by 'config').
+   -M:            Only access masters config (used by 'config').
+   -S:            Only access slaves config (used by 'config').
+   -w:            Rewrite the config file after set online (used by 'config').
+command:
+   nodes:   Show cluster nodes status (default)
+   keys:    Key prefix statistics
+   moni:    Top10 command rolling statistics
+   trace:   Hotspot key tracing statistics
+   slowlog: Querying cluster slow command logs
+   config:  Get/Set cluster config
+Examples:
+   # show cluster status by node(127.0.0.1:6379)
+   $ $(basename $0) nodes
+   # get cluster slowlog by node(127.0.0.1:7379)
+   $ $(basename $0) -p 7379 slowlog
+   # get config of loglevel by node(10.10.10.3:7379)
+   $ $(basename $0) -h 10.10.10.3 -p 7379 -k loglevel config\n"
+
+# MYPID: pid of myself
+readonly MYPID=$$
+# XXX_PREFIX: temp file prefix name for subcommand
+readonly CMDS_PREFIX=".RCTOOL-CMDS-"
+readonly NODES_PREFIX=".RCTOOL-NODES-"
+readonly INFOS_PREFIX=".RCTOOL-INFOS-"
+readonly CLIENTS_PREFIX=".RCTOOL-CLIENTS-"
+readonly MONI_PREFIX=".RCTOOL-MONI-"
+readonly SLOWLOG_PREFIX=".RCTOOL-SLOWLOG-"
+
+# redis server ip & password(default: 'REDISCLI_AUTH' environment variable)
+REDIS_HOST="127.0.0.1"
+REDIS_PORT=6379
+REDIS_PASS="${REDISCLI_AUTH}"
+# PREFIX_LVL: prefix key level, use option '-l' to set
+PREFIX_LVL=3
+# TRACE_TIME: how long to trace: default 10s
+TRACE_TIME=10
+# ROLL_TIME: rolling time for moni: default 3s
+ROLL_TIME=3
+# MONI_COUNT: moni N times: default infinite
+MONI_COUNT=-1
+# SLOW_COUNT: count of slowlog to get: default 100
+SLOW_COUNT=100
+# KEYS_COUNT: count of keys to stat by prefix: default 100000
+KEYS_COUNT=100000
+# CMD: subcommand: default 'nodes'
+CMD="nodes"
+
+
+####################### function ########################
+
+# clean temp files
+function cleanup() {
+  rm -f ${CMDS_PREFIX}*.${MYPID} \
+        ${NODES_PREFIX}*.${MYPID} \
+        ${INFOS_PREFIX}*.${MYPID} \
+        ${CLIENTS_PREFEX}*.${MYPID} \
+        ${MONI_PREFIX}*.${MYPID} \
+        ${SLOWLOG_PREFIX}*.${MYPID} || true
+}
+# when exception: kill self & subprocess
+function exitup() {
+  cleanup
+  kill -9 0
+}
+# print info message
+function debug() { 
+  echo -e "$(date +'%F %T') \033[37m<INFO>\033[0m "$@
+}
+# print warning message
+function warn() { 
+  echo -e "$(date +'%F %T') \033[31m<WARN>\033[0m "$@
+}
+# check version
+function version_ge() { 
+  test "$(echo "$@" | tr " " "\n" | sort -rV | head -n 1)" == "$1"
+}
+
+#######################################
+# check option is integer
+# Globals:
+#   USAGE
+# Arguments:
+#   1 - option value
+#   2 - option type
+# Returns:
+#   None
+#######################################
+function assert_int() {
+  local -r int="${1:?missing value}"
+  if [[ ! "$int" =~ ^[0-9]+$ ]]; then
+    warn "Invalid integer for option '-${2}': $int"
+    echo -e "$USAGE"
+    exit 1
+  fi
+}
+
+#######################################
+# check redis-cli to be useful 
+# Globals:
+#   REDISCLI_VERSION - redis-cli version
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function check_redis_cli() {
+  # update PATH environment variable
+  export PATH=$REDIS_HOME:.:$PATH
+  local version=$(redis-cli -v 2>&1)
+  if [[ $? -ne 0 ]]; then
+    warn "Please use the REDIS_HOME environment variable to pass redis-cli path!"
+    exit 1
+  fi
+  REDISCLI_VERSION=$(echo $version | awk -F" |-" '{print $3}')
+}
+
+#######################################
+# set REDISCLI_AUTH environment variable
+# Globals:
+#   REDIS_PASS - redis password
+#   REDISCLI_AUTH - password used by redis-cli
+#   AUTH - password option
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function set_rediscli_auth() { 
+  if [[ -n "$REDIS_PASS" ]]; then
+    if version_ge "$REDISCLI_VERSION" "5.0.3"; then
+      export REDISCLI_AUTH="$REDIS_PASS"
+    else
+      AUTH="-a $REDIS_PASS"
+    fi
+  else
+    export -n REDISCLI_AUTH
+    AUTH=""
+  fi
+}
+
+#######################################
+# cluster cluster nodes list
+# Globals:
+#   REDIS_HOST - redis ip
+#   REDIS_PORT - redis port
+#   AUTH - password option
+#   CLUSTER_NODES_ALL - all nodes info
+#   MASTER_LIST - master addr list
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function get_cluster_nodes() {
+  # ID ip:port flags masterID pingtime pongtime configepoch connect slots
+  local nodes_res=""
+  nodes_res=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} cluster nodes 2>&1)
+  if [[ $? -eq 0 && "${nodes_res:0:8}" != "LOADING " && "${nodes_res:0:7}" != "NOAUTH " ]]; then
+    # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
+    CLUSTER_NODES_ALL=$(echo "$nodes_res"|awk '{if($4=="-"){print $1" master "$0}else{print $4" slave "$0}}'|sort)
+  fi
+  if [[ ${#CLUSTER_NODES_ALL} -eq 0 ]]; then
+    warn "Access redis(${REDIS_HOST}:${REDIS_PORT}) failed: \033[41;37m${nodes_res}\033[0m"
+    if [ "${nodes_res:0:7}" == "NOAUTH " ]; then
+      warn "Please input redis password by option '-a <password>'!"
+    elif [ "${nodes_res:0:8}" == "LOADING " ]; then
+      warn "Please retry the command after LOADING finished!"
+    else
+      warn "Please input active redis by option '-h <ip> -p <port>'!"
+    fi
+    exit 1
+  fi
+  # cut cluster port from node addr
+  CLUSTER_NODES_ALL=$(echo "$CLUSTER_NODES_ALL"|sed -re 's/@[0-9]*//g')
+  
+  # masters addr list
+  MASTER_LIST=$(echo "${CLUSTER_NODES_ALL}"|grep -w master|grep -v noaddr|awk '{print $4}')
+  
+  # all nodes addr list
+  NODES_LIST=$(echo "${CLUSTER_NODES_ALL}"|grep -v noaddr|awk '{print $4}')
+}
+
+#######################################
+# check redis status by ping
+# Globals:
+#   REDIS_HOST - redis ip
+#   REDIS_PORT - redis port
+#   AUTH - password option
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function check_redis_by_ping() {
+  local ping_res=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} ping 2>&1)
+  if [ "$ping_res" != "PONG" ]; then
+    warn "Access redis(${REDIS_HOST}:${REDIS_PORT}) failed: \033[41;37m${ping_res}\033[0m"
+    if [ "${ping_res:0:7}" == "NOAUTH " ]; then
+      warn "Please input redis password by option '-a <password>'!"
+    elif [ "${ping_res:0:8}" == "LOADING " ]; then
+      warn "Please retry the command after LOADING finished!"
+    else
+      warn "Please input active redis by option '-h <ip> -p <port>'!"
+    fi
+    exit 1
+  fi
+}
+
+#######################################
+# print divide line with title
+# Arguments:
+#   1 - length of line
+#   2 - character of line
+#   3 - title
+#   4 - new line
+# Returns:
+#   divide line
+#######################################
+function draw_divide_line() {
+  local count=$1
+  local ch=$2
+  local title=$3
+  local newline=${4-'\n'}
+  local title_len=${#title}
+  local pre_len=$(((count-title_len)/2))
+  local str_result=""
+  for((i=1;i<=$pre_len;i++))
+  do 
+    str_result+=$ch
+  done
+  str_result+="$title"
+  local sub_len=$((count-title_len-pre_len))
+  for((i=1;i<=$sub_len;i++))
+  do 
+    str_result+=$ch
+  done
+  echo -en "$str_result$newline"
+}
+
+#######################################
+# show progress bar
+# Arguments:
+#   1 - length of line
+#   2 - character of line
+#   3 - title
+#   4 - new line
+# Returns:
+#   progress bar
+#######################################
+function show_bar() {
+  local head_msg=$1
+  local total_num=$2
+  local proc_num=$3
+  local progress=0
+  # length of bar is 50
+  if [[ $total_num -eq 0 ]]; then
+    progress=50
+  else
+    progress=$((proc_num * 50 / total_num))
+    if [[ $progress -gt 50 ]]; then
+      progress=50
+    fi
+  fi
+  
+  local progs_info=""
+  for ((i=0;i<$progress;i++)); do
+    progs_info="#${progs_info}"
+  done
+  if [ "$progs_info" = "" ]; then
+    progs_info="#"
+  fi
+  printf "<%s> | [%-50s]%d\n" $head_msg $progs_info $proc_num
+}
+
+#######################################
+# show progress to figured out
+# Arguments:
+#   1 - nodes info
+# Returns:
+#   progress bar
+#######################################
+function show_progress() {
+  local node_num=$(echo -e "$1"|wc -l)
+  local proc_num=0
+  # show progress with tty, and the cluster nodes > 20
+  tty >/dev/null
+  if [[ $? -eq 0 && $node_num -gt 20 ]]; then
+    while :;
+    do
+      proc_num=$(wc -l ${NODES_PREFIX}*.${MYPID} 2>/dev/null|tail -1|awk '{print $1}')
+      show_bar "TOTAL:$node_num" $node_num $proc_num
+      # break when figured out
+      if [[ $node_num -eq $proc_num ]]; then
+        break
+      fi
+      sleep 0.5
+      # reset cursor
+      echo -ne "\033[1A\r"
+    done
+  fi
+}
+
+#######################################
+# config get/set for cluster
+# Globals:
+#   CLUSTER_NODES_ALL - cluster nodes list
+#   REDIS_HOST - redis ip
+#   REDIS_PORT - redis port
+#   REDIS_PASS - redis password
+#   AUTH - password option
+#   CONFIG_SET - config set value
+#   CONFIG_KEY - config name to get/set
+#   CONFIG_VALUE - config value to set
+#   ROLE_TYPE - role type: master,slave,all
+# Arguments:
+#   None
+# Returns:
+#   get/set result
+#######################################
+function setget_config() {
+  # CLUSTER_NODES_ALL:
+  # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
+  get_cluster_nodes
+  
+  OLDIFS=$IFS
+  local head_line=$(draw_divide_line 80 "=")
+  local div_line=$(draw_divide_line 80 "-")
+  local conf_res=""
+  if [[ -z "$CONFIG_KEY" ]]; then
+    # audit config value with diffrent values
+    declare -A map_config
+    local conf_key=""
+    local conf_val=""
+    local node_count=$(echo "$CLUSTER_NODES_ALL"|grep "$ROLE_TYPE"|wc -l)
+    debug "Audit the config with diffrent value on \033[37m${ROLE_TYPE:-all}(count=$node_count)\033[0m nodes:"
+    for node in $(echo "$CLUSTER_NODES_ALL"|grep "$ROLE_TYPE"|grep -v noaddr|awk '{print $4}'|sort); do
+      # ip & port
+      local node_ip=${node%:*}
+      local node_port=${node##*:}
+      if [ "$node_ip" = "" ]; then
+        node_ip="127.0.0.1"
+      fi
+      # get all configs from redis
+      conf_res=$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} --raw config get "*"|awk '{if(x==0){x=1;printf("%s=",$1);}else{x=0;print $0}}')
+      if [[ ${#conf_res} -lt 200 ]]; then
+        warn "Get config from ${node_ip}:${node_port} failed:  \033[41;37m${conf_res}\033[0m"
+        continue
+      fi
+      IFS=$'\n'
+      for conf in $(echo "$conf_res"); do
+        conf_key=${conf%%=*}
+        conf_val=${conf#*=}
+        map_config[$conf_key]="${map_config[$conf_key]}${conf_val}\n"
+      done        
+      IFS=$OLDIFS
+    done
+    
+    # audit the config values
+    head_line=$(draw_divide_line 100 "=")
+    div_line=$(draw_divide_line 100 "-") 
+    local title=$(printf " %-32s| %s | %s" "CONFIG_NAME" "UNIQ" "DIFF_VALUES")
+    echo -e "${head_line}\n${title}\n${div_line}"
+    local diff_count=0
+    local diff_info=""
+    local info=""
+    for key in ${!map_config[@]}; do
+      diff_count=$(echo -en "${map_config[$key]}" | sort -u | wc -l)
+      local values=$(echo -en "${map_config[$key]}" | sort -u | tr '\n' ',')
+      # delete the last ','
+      values=${values%?}
+      if [[ ${#values} -gt 58 ]]; then
+        values="${values:0:55}..."
+      fi
+      # high light for diffrent values
+      info=$(printf " %-32s| %-4s | %-58s" "${key}" "$diff_count" "${values}")
+      if [[ $diff_count -gt 1 ]]; then
+        info="\033[43;31m${info}\033[0m"
+      fi
+
+      if [[ ${#diff_info} -gt 0 ]]; then
+        diff_info="${diff_info}\n${info}"
+      else
+        diff_info="${info}"
+      fi
+    done
+    # sort by UNIQ
+    echo -en "$diff_info" | sort -t '|' -nk 2,2
+    echo -e "${div_line}\n${title}\n${head_line}"
+  else
+    # get/set the config value
+    local title=$(printf " %-22s| %s" "REDIS" "$CONFIG_KEY")
+    local last_print=""
+    if [[ "$CONFIG_SET" = "yes" ]]; then
+      debug "SET the value of '$CONFIG_KEY' on \033[37m${ROLE_TYPE:-all}\033[0m nodes:" 
+      # print at last for config set
+      last_print="${head_line}\n${title}\n${div_line}\n"
+    else
+      debug "GET the value of '$CONFIG_KEY' on \033[37m${ROLE_TYPE:-all}\033[0m nodes:" 
+      # print immediatly for config get
+      echo -en "${head_line}\n${title}\n${div_line}\n"
+    fi
+    
+    # Loop nodes to process
+    local old_pass="$REDIS_PASS"
+    for node in $(echo "$CLUSTER_NODES_ALL"|grep "$ROLE_TYPE"|grep -v noaddr|awk '{print $4}'|sort); do
+      # use the origin password
+      REDIS_PASS="$old_pass"
+      set_rediscli_auth
+      # ip & port
+      local node_ip=${node%:*}
+      local node_port=${node##*:}
+      if [ "$node_ip" = "" ]; then
+        node_ip="127.0.0.1"
+      fi
+      
+      # CONFIG SET
+      if [[ "$CONFIG_SET" = "yes" ]]; then
+        conf_res=$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} config set "$CONFIG_KEY" "$CONFIG_VALUE")
+        # update the new password
+        if [[ "$CONFIG_KEY" = "requirepass" && "$conf_res" = "OK" ]]; then
+          REDIS_PASS="$CONFIG_VALUE"
+          set_rediscli_auth
+        fi
+        # CONFIG REWRITE
+        if [[ $WRITE_CONFIG = "yes" && "$conf_res" = "OK" ]]; then
+          conf_res="write config file: "$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} config rewrite 2>&1)
+        fi
+        debug "[${node_ip}:${node_port}]: CONFIG SET $CONFIG_KEY $CONFIG_VALUE : [$conf_res]"
+      fi
+      
+      # CONFIG GET
+      conf_res=$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} --csv config get "$CONFIG_KEY" 2>&1 | awk -F',' '{print $2}')
+      conf_res=$(printf " %-22s| %s" "${node_ip}:${node_port}" "$conf_res")
+      if [[ "$CONFIG_SET" = "yes" ]]; then
+        # print at last for config set
+        last_print="${last_print}${conf_res}\n"
+      else
+        # print immediatly for config get
+        echo -e "$conf_res"
+      fi
+    done
+
+    if [[ "$CONFIG_SET" = "yes" ]]; then
+      # print the new value after config set
+      debug "Get the value of '$CONFIG_KEY' on \033[37m${ROLE_TYPE:-all}\033[0m nodes after CONFIG SET:" 
+      echo -en "${last_print}"
+    fi
+    echo -e "${head_line}"
+  fi
+}
+
+#######################################
+# get nodes info by ip
+# Globals:
+#   CLUSTER_NODES_ALL - cluster nodes list
+#   REDIS_HOST - redis ip
+#   NODES_PREFIX - .RCTOOL-NODES-
+#   INFOS_PREFIX - .RCTOOL-INFOS-
+#   MYPID - pid
+# Arguments:
+#   1 - ip
+# Returns:
+#   None
+#######################################
+function subprocess_nodes_by_ip() {
+  local deal_ip=$1
+  # init result file
+  local ret_file="${NODES_PREFIX}${deal_ip}.${MYPID}"
+  >$ret_file
+  local info_file="${INFOS_PREFIX}${deal_ip}.${MYPID}"
+  >$info_file
+  
+  declare -A map_nodes
+  OLDIFS=$IFS
+  IFS=$'\n'
+  local master_addr=""
+  for node in $(echo "$CLUSTER_NODES_ALL"); do
+    IFS=$OLDIFS
+    # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
+    local node_addr=$(echo "$node"|awk '{print $4}')
+    local no_addr=$(echo "$node"|grep -w noaddr|wc -l)
+    if [[ $no_addr -eq 1 ]]; then
+      node_addr="noaddr$node_addr"
+    fi
+    local role="slave"
+    local is_master=$(echo "$node"|grep -w master|wc -l)
+    if [[ $is_master -eq 1 ]]; then
+      master_addr="$node_addr"
+      role="master"
+    fi
+    
+    local node_ip=${node_addr%:*}
+    local node_port=${node_addr##*:}
+    if [ "$deal_ip" != "" ]; then
+      if [ "$node_ip" != "$deal_ip" ]; then
+        continue
+      fi
+    else
+      if [ "$node_ip" != "noaddr" -a "$node_ip" != "" ]; then
+        continue
+      fi
+    fi
+    if [ "$node_ip" = "" ]; then
+      node_ip=${REDIS_HOST}
+    fi
+    
+    # ELAPSED: time2 - time1
+    # $ echo -en "time\r\ntime\r\n"|redis-cli -h 172.16.17.3 -p 7290  --raw 
+    # 1582680185
+    # 906676
+    # 1582680185
+    # 906940
+    local ustime1=0
+    local ustime2=0
+    local elapsed="-"
+    local status="FAIL"               
+    local total_time=$(echo -en "time\r\ntime\r\n" | redis-cli -h ${node_ip} -p ${node_port} ${AUTH} --raw 2>/dev/null)
+    if [ "$total_time" != "" ]; then
+      if [ "${total_time:0:8}" == "LOADING " ];then
+        status="LOAD"
+      elif [ "${total_time:0:7}" == "NOAUTH " ];then
+        status="NOAUTH"
+      else
+        status="OK"
+        ustime1=$(echo $total_time|awk '{printf("%.f", $1*1000000+$2)}')
+        ustime2=$(echo $total_time|awk '{printf("%.f", $3*1000000+$4)}')
+        elapsed=$(expr $ustime2 - $ustime1)
+      fi
+    fi
+    
+    # INFO
+    local node_info=""
+    local version="-"
+    local startime="-"
+    local usemem="-"
+    local usemem_byte="-"
+    local ops="-"
+    local clients="-"
+    local keynum="-"
+    # cpu
+    local ustime="-"
+    local cpu="-"
+    
+    if [ "$status" == "OK" -o "$status" == "LOAD" ]; then
+      ustime=$(date +'%s %N'|awk '{printf("%.f", $1*1000000+$2/1000)}')
+      node_info=$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} info 2>/dev/null)
+      if [ "$node_info" != "" -a "${node_info:0:7}" != "NOAUTH " ]; then
+        version=$(echo "$node_info"|awk -F":|-|\r" '{if($1=="redis_version"){print $(NF-1)}}')
+        startime=$(echo "$node_info"|awk -F":|\r" '{if($1=="uptime_in_seconds"){print $2}}')
+        usemem=$(echo "$node_info"|awk -F":|\r" '{if($1=="used_memory_human"){print $2}}')
+        usemem_byte=$(echo "$node_info"|awk -F":|\r" '{if($1=="used_memory"){print $2}}')
+        ops=$(echo "$node_info"|awk -F":|\r" '{if($1=="instantaneous_ops_per_sec"){print $2}}')
+        clients=$(echo "$node_info"|awk -F":|\r" '{if($1=="connected_clients"){print $2}}')
+        # db0:keys=5001,expires=0,avg_ttl=0
+        keynum=$(echo "$node_info"|awk -F":|=|,|\r" '{if($1=="db0"){print $3}}')
+        if [ "$keynum" = "" ]; then
+          keynum="0"
+        fi
+        # cpu info
+        cpu=0
+        for N in $(echo "$node_info"|grep -E 'used_cpu_sys:|used_cpu_user:'|awk -F":" '{printf("%.f\n", $2*1000000)}'); 
+        do
+          cpu=$(($cpu + $N))
+        done
+      fi
+    fi
+    local node_id=$(echo "$node"|awk '{print $3}')
+    # 1.masteraddr 2.role 3.status 4.version 5.uptime 6.keys 7.usemem 8.client 9.ops 10.rtt 11.usemem_byte 12.ustime 13.cpu
+    map_nodes[$node_id]="$master_addr ${role} ${status} $version $startime $keynum $usemem $clients $ops $elapsed $usemem_byte $ustime $cpu "
+    echo "1" >>$ret_file
+  done
+  # sleep for a while 
+  sleep 0.5
+  # calc the %cpu
+  IFS=$'\n'
+  for node in $(echo "$CLUSTER_NODES_ALL"); do
+    IFS=$OLDIFS
+    # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
+    local node_addr=$(echo "$node"|awk '{print $4}')
+    local no_addr=$(echo "$node"|grep -w noaddr|wc -l)
+    if [[ $no_addr -eq 1 ]]; then
+      node_addr="noaddr$node_addr"
+    fi
+    local node_ip=${node_addr%:*}
+    local node_port=${node_addr##*:}
+    if [ "$deal_ip" != "" ]; then
+      if [ "$node_ip" != "$deal_ip" ]; then
+        continue
+      fi
+    else
+      if [ "$node_ip" != "noaddr" -a "$node_ip" != "" ]; then
+        continue
+      fi
+    fi
+    if [ "$node_ip" = "" ]; then
+      node_ip=${REDIS_HOST}
+    fi
+    # 1.masteraddr 2.role 3.status 4.version 5.uptime 6.keys 7.usemem 8.client 9.ops 10.rtt 11.usemem_byte 12.ustime 13.cpu 14.%cpu
+    local node_id=$(echo "$node"|awk '{print $3}')
+    local node_res="${map_nodes[$node_id]}"
+    local uslast=$(echo "$node_res"|awk '{print $12}')
+    local cpulast=$(echo "$node_res"|awk '{print $13}')
+    if [ "$cpulast" = "-" ];then
+      echo "$node_res - ${node}" >>$info_file
+      echo "1" >>$ret_file
+      continue
+    fi
+    local incrcpu=""
+    local ustime=$(date +'%s %N'|awk '{printf("%.f", $1*1000000+$2/1000)}')
+    local cpuinfo=$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} info cpu 2>/dev/null)
+    if [ "$cpuinfo" != "" -a "${cpuinfo:0:7}" != "NOAUTH " ]; then
+      local cpu=0
+      for N in $(echo "$cpuinfo"|grep -E 'used_cpu_sys:|used_cpu_user:'|awk -F":" '{printf("%.f\n", $2*1000000)}'); 
+      do
+        cpu=$(($cpu + $N))
+      done
+      incrcpu=$(echo "$cpu $cpulast $ustime $uslast"|awk '{if($1>=$2){printf("%.1f",($1-$2)*100/($3-$4)); }else{printf("%.1f",$1*100/($3-$4));}}')
+    else
+      incrcpu="-"
+    fi
+    echo "$node_res $incrcpu ${node}" >>$info_file
+    echo "1" >>$ret_file
+  done
+  IFS=$OLDIFS
+}
+
+#######################################
+# show cluster nodes status
+# Arguments:
+#   1 - nodes info list
+# Returns:
+#   cluster nodes status
+#######################################
+function show_cluster_status() {
+  # show cluster nodes    
+  # SERVER  STATUS  ROLE  VERSION  UPTIME(s)  KEYS  USEMEM %CPU CLIENTS  OPS  RTT(us)  SLOTS
+  awk_cmd='
+    BEGIN {
+      if(coltime <= 0) coltime=systime();
+      printf("================================================== %s ==================================================\n", strftime("%F %T", coltime));
+      printf("%-24s %-6s %-7s %-8s %-9s %-9s %-8s %-6s %-7s %-6s %-9s %-s \n",
+        "SERVER","STATUS","ROLE","VERSION","UPTIME(s)","KEYS","USEMEM","%CPU","CLIENTS","OPS","RTT(us)","SLOTS");
+      print "-------------------------------------------------------------------------------------------------------------------------"
+    }
+    {
+      mem=substr($8,1,length($8)-1);
+      unit=substr($8,length($8));
+      if(unit=="G") {
+        mem=mem*1073741824
+      } else if(unit=="M") {
+        mem=mem*1048576
+      } else if(unit=="K") {
+        mem=mem*1024
+      }
+      allkey+=$7;
+      allmem+=mem;
+      allcli+=$10;
+      allops+=$11;
+      allcpu+=$9;
+      allnode+=1;
+      if($4~/master/) {
+        masterkey+=$7;
+        mastermem+=mem;
+        mastercli+=$10;
+        masterops+=$11;
+        mastercpu+=$9;
+        masters+=1;
+      }
+      if($3=="OK") {
+        oknum+=1;
+      }else if($3=="FAIL") {
+        failnum+=1;
+      }else if($3=="NOAUTH") {
+        noauth+=1;
+      }else if($3=="LOAD") {
+        load+=1;
+      }
+      
+      len=length($2);
+      if(len>21){
+        addr=substr($2,0,14)".."substr($2,len-4,5);
+      } else {
+        addr=$2;
+      }
+      match($2,/:[0-9]+$/);
+      masterip=substr($2,1,RSTART-1);
+      if($4~/master/) {
+        printf("%-24s ", addr);
+        mapip[masterip]+=1;
+      } else {
+        printf(" |-%-21s ", addr);
+        mapip[masterip]+=0;
+      }
+      printf("%-6s %-7s %-8s %-9s %-9s %-8s %-6s %-7s %-6s %-9s",$3,$4,$5,$6,$7,$8,$9,$10,$11,$12);
+      for(i=13;i<=NF;i++) {
+        printf(" %s",$i);
+      }
+      printf("\n");
+    } END {
+      print "_________________________________________________________________________________________________________________________"
+      if(allmem<1048576){
+        allmem=allmem/1024
+        allmem=sprintf("%.1fK",allmem)
+      }else if(allmem<1073741824){
+        allmem=allmem/1048576
+        allmem=sprintf("%.1fM",allmem)
+      }else{
+        allmem=allmem/1073741824
+        allmem=sprintf("%.1fG",allmem)
+      }
+      if(mastermem<1048576){
+        mastermem=mastermem/1024
+        mastermem=sprintf("%.1fK",mastermem)
+      }else if(mastermem<1073741824){
+        mastermem=mastermem/1048576
+        mastermem=sprintf("%.1fM",mastermem)
+      }else{
+        mastermem=mastermem/1073741824
+        mastermem=sprintf("%.1fG",mastermem)
+      }
+      printf("SUM(master/all): NODE=%s/%s KEY=%s/%s MEM=%s/%s CLI=%s/%s OPS=%s/%s CPU=%s/%s\n",
+        masters,allnode,masterkey,allkey,mastermem,allmem,mastercli,allcli,masterops,allops,mastercpu,allcpu);
+      if(noauth>0) {
+        printf("\033[41;37m!!!!! <WARNING> Access redis for \"NOAUTH\": Please use the option \"-a <password>\" !!!!!\033[0m\n");
+      }
+      if(load>0) {
+        printf("\033[43;37m!!!!! <WARNING> Please wait the status is \"LOAD\": The nodes are loading data !!!!!\033[0m\n");
+      }
+      if(failnum>0) {
+        printf("\033[41;37m!!!!! <WARNING> Please check the status is \"FAIL\": The nodes maybe offline !!!!!\033[0m\n");
+      }
+      minnum=masters
+      maxnum=0
+      for(ip in mapip) {
+        if(minnum > mapip[ip]) {
+          minnum=mapip[ip];
+        }
+        if(maxnum < mapip[ip]) {
+          maxnum=mapip[ip];
+        }
+      }
+      if(minnum != maxnum) {
+        printf("\033[41;37m!!!!! <WARNING> Masters unbalance on hosts: min/max = %s/%s !!!!!\033[0m\n", minnum,maxnum);
+      }
+      print "========================================================================================================================="
+    }'
+
+  # compact format
+  # 1,SERVER,STATUS,ROLE,VERSION,UPTIME,KEYS,USEMEM,%CPU,CLIENTS,OPS,DELAY,SLOTS&
+  echo "$1" | tr '&' '\n' | awk -F',' -v coltime=${2:-0} "$awk_cmd"
+}
+
+#######################################
+# get cluster nodes status
+# Globals:
+#   CLUSTER_NODES_ALL - cluster nodes list
+#   INFOS_PREFIX - .RCTOOL-INFOS-
+#   MYPID - pid
+#   OUTPUT_RAW_DATA - print raw data
+# Arguments:
+#   1 - nodes info list
+# Returns:
+#   cluster nodes status
+#######################################
+function get_cluster_status() {
+  # CLUSTER_NODES_ALL:
+  # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
+  get_cluster_nodes
+  
+  # get all nodes info by ip
+  local last_ip="Nil"
+  for node in $(echo "$CLUSTER_NODES_ALL"|awk '{print $4}'|sort); do
+    # ip
+    local ip=${node%:*}
+    if [ "$last_ip" != "$ip" ]; then
+      last_ip=$ip
+      {
+        subprocess_nodes_by_ip $last_ip
+      }&
+    fi
+  done
+  # show progress: every node need to access twice in order to calc %cpu
+  show_progress "${CLUSTER_NODES_ALL}\n${CLUSTER_NODES_ALL}"
+  # wait subprocess done
+  wait
+  
+  # 14: masteraddr role    status  version  startime keynum   usemem   clients  ops         elapsed usemembyte ustime cpu %cpu
+  # 11: masterID   role    ID      ip:port  flags    masterID pingtime pongtime configepoch connect slots
+  local nodes_res=$(cat ${INFOS_PREFIX}*.${MYPID} | sort)
+  # compact format
+  # 1,SERVER,STATUS,ROLE,VERSION,UPTIME,KEYS,USEMEM,CPU,CLIENTS,OPS,DELAY,SLOTS&
+  local awk_cmd='
+    {
+      printf("1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",$18,$3,$2,$4,$5,$6,$7,$14,$8,$9,$10);
+      if(NF > 24) {
+        for(i=25;i<=NF;i++) {
+          if(i==25) {
+            printf(",%s",$i);
+          } else {
+            printf(" %s",$i);
+          }
+        }
+      }
+      printf("&");
+    }'
+  local compres=$(echo "$nodes_res" | awk "$awk_cmd")
+  # delete the last '&'
+  compres=${compres:0:-1}
+  # echo "$compres"
+  if [ "$OUTPUT_RAW_DATA" = "yes" ]; then
+    echo "$compres"
+  else
+    show_cluster_status "$compres"
+  fi
+}
+
+#######################################
+# get commands info by ip
+# Globals:
+#   MASTER_LIST - cluster nodes list
+#   REDIS_HOST - redis ip
+#   MONI_PREFIX - .RCTOOL-MONI-
+#   MYPID - pid
+#   AUTH - auth info
+# Arguments:
+#   1 - ip
+# Returns:
+#   commands info
+#######################################  
+function subprocess_monitor_cmds_by_ip() {
+  local deal_ip=$1
+  # init result file
+  local ret_file="${MONI_PREFIX}${deal_ip}.${MYPID}"
+  >$ret_file
+  for node_addr in $(echo "$MASTER_LIST"|grep $deal_ip); do
+    # ADDR
+    local node_ip=${node_addr%:*}
+    local node_port=${node_addr##*:}
+    if [ "$node_ip" = "127.0.0.1" -o "$node_ip" = "" ]; then
+      node_ip=${REDIS_HOST}
+    fi
+    
+    # cmdstat_get:calls=1,usec=1,usec_per_call=1.00
+    echo -en 'info stats\ninfo commandstats\ninfo cpu\n'|redis-cli -h ${node_ip} -p ${node_port} ${AUTH} 2>/dev/null >>$ret_file
+    if [ $? -ne 0 ]; then
+      warn "Can't connect to redis(${node_ip}:${node_port})!\n"
+    fi
+  done
+  # delete character '\r'
+  sed -i "s/\r//" ${ret_file}
+}
+
+#######################################
+# rolling stats commands of masters
+# Globals:
+#   MASTER_LIST - cluster nodes list
+#   REDIS_HOST - redis ip
+#   REDIS_PORT - redis port
+#   SINGLE_NODE - stat the specify node only
+#   CMDS_PREFIX - .RCTOOL-CMDS-
+#   MYPID - pid
+#   MONI_COUNT - run times
+#   MONI_LATENCY - show command average latency
+# Arguments:
+#   None
+# Returns:
+#   commands stats
+#######################################  
+function moni_commands() {
+  # CLUSTER or SINGLE
+  if [ "$SINGLE_NODE" != "yes" ]; then
+    # MASTER_LIST
+    get_cluster_nodes
+    local node_num=$(echo "$MASTER_LIST"|wc -l)
+    debug "[CLUSTER] monitor with $node_num masters from ${REDIS_HOST}:${REDIS_PORT} every $ROLL_TIME seconds"
+  else
+    check_redis_by_ping
+    MASTER_LIST="${REDIS_HOST}:${REDIS_PORT}"
+    debug "[SINGLE] monitor only the node ${REDIS_HOST}:${REDIS_PORT} every $ROLL_TIME seconds"
+  fi
+  
+  # cmdstat_get:calls=1,usec=1,usec_per_call=1.00
+  local awk_cmd='
+    {
+      if($1~/cmdstat_/) {
+        cmdname=substr($1,9);
+        if(lastcmd=="") {
+          lastcmd=cmdname;
+        }
+        if(lastcmd!=cmdname) {
+          printf("%s %s %s\n",lastcmd,cmdcalls,cmdusec);
+          lastcmd=cmdname;
+          cmdcalls=0;
+          cmdusec=0;
+        }
+        cmdcalls+=$3;
+        cmdusec+=$5;
+      }
+    } END {if(lastcmd!=""){printf("%s %s %s\n",lastcmd,cmdcalls,cmdusec);}}'
+  
+  # rolling stats ...
+  OLDIFS=$IFS
+  local run_count=0
+  local base_cmd_stat=""
+  local last_cmd_stat=""
+  local last_time=0
+  local last_total=0
+  local last_cpu=0
+  local last_net_input=0
+  local last_net_output=0
+  local last_conn_total=0
+  local ary_top_cmd_name=()
+  while true; do
+    # exec 'info' command on all masters 
+    local last_ip="Nil"
+    for node in $(echo "$MASTER_LIST"|sort); do
+      # ip
+      local ip=${node%:*}
+      if [ "$last_ip" != "$ip" ]; then
+        last_ip=$ip
+        {
+          subprocess_monitor_cmds_by_ip $last_ip
+        }&
+      fi
+    done
+    wait
+    
+    # current time
+    local curr_time=$(date +'%s %N'|awk '{printf("%.f", $1*1000000+$2/1000)}')
+    
+    # commands info
+    local cmd_stat=$(cat ${MONI_PREFIX}*.${MYPID} 2>/dev/null |grep cmdstat_| sort | awk -F"=|,|:" "$awk_cmd")
+    # summary commands
+    local curr_total=$(echo -e "$cmd_stat"|awk '{calls+=$2;} END {print calls;}')
+    
+    # cpu
+    local curr_cpu=0
+    for N in $(cat ${MONI_PREFIX}*.${MYPID} 2>/dev/null |grep -E 'used_cpu_sys:|used_cpu_user:'|awk -F":" '{printf("%.f\n", $2*1000000)}'); 
+    do
+      curr_cpu=$(($curr_cpu + $N))
+    done
+
+    # don't use awk for high precision
+    local curr_net_input=0
+    for N in $(cat ${MONI_PREFIX}*.${MYPID} 2>/dev/null |grep total_net_input_bytes|awk -F":" '{print $2}'); 
+    do 
+      curr_net_input=$(($curr_net_input + $N))
+    done
+    curr_net_input=$(expr $curr_net_input / 1024)
+
+    # don't use awk for high precision
+    local curr_net_output=0
+    for N in $(cat ${MONI_PREFIX}*.${MYPID} 2>/dev/null |grep total_net_output_bytes|awk -F":" '{print $2}'); 
+    do 
+      curr_net_output=$(($curr_net_output + $N))
+    done
+    curr_net_output=$(expr $curr_net_output / 1024)
+
+    # connections
+    local curr_conn_total=0
+    for N in $(cat ${MONI_PREFIX}*.${MYPID} 2>/dev/null |grep total_connections_received|awk -F":" '{print $2}'); 
+    do 
+      curr_conn_total=$(($curr_conn_total + $N))
+    done
+
+    # show the TITLE: update the TOP10 command
+    if [[ $((run_count%20)) -eq 1 ]]; then
+      # Get the increment of commands
+      local cmd_incr=""
+      # calc the increment
+      IFS=$'\n'
+      for cmd_curr in $(echo "$cmd_stat"); do
+        IFS=$OLDIFS
+        local curr_info=(${cmd_curr})
+        local last_info=($(echo "$base_cmd_stat"|grep -w ${curr_info[0]}))
+        
+        cmd_incr+=${curr_info[0]}
+        if [ "${last_info[1]}" = "" ]; then
+          cmd_incr+=" ${curr_info[1]} ${curr_info[2]}"
+        elif [[ ${last_info[1]} -gt ${curr_info[1]} ]]; then
+          cmd_incr+=" ${curr_info[1]} ${curr_info[2]}"
+        else
+          cmd_incr+=" $[curr_info[1]-last_info[1]] $[curr_info[2]-last_info[2]]"
+        fi
+        cmd_incr+="\n"
+      done
+      IFS=$OLDIFS
+      
+      # array of TOP10 commands
+      ary_top_cmd_name=()
+      local i=0
+      IFS=$'\n'
+      for cmd_curr in $(echo -e "$cmd_incr"|sort -rnk 2); do
+        if [[ $i -lt 10 ]]; then
+          ary_top_cmd_name[$i]=${cmd_curr%% *}
+        else
+          break
+        fi
+        i=$((i+1))
+      done
+      IFS=$OLDIFS
+      
+      # show the TITLE: --TOP10 commands--  TOTAL net-input net-output
+      local title_info=""
+      for ((row=0;row<${#ary_top_cmd_name[@]};row++));do
+        title_info+=$(printf "%-7s " ${ary_top_cmd_name[$row]})
+      done
+      local width=$((${#title_info}-1))
+      local title_head=$(draw_divide_line $width "-" "TOP${#ary_top_cmd_name[@]} commands $(date +'%F %T')" "")
+      # length: 8-11-11
+      title_head+=" -----all------ -----------netio-----"
+      title_info+="TOTAL   %CPU   CONNS IN(KB)  OUT(KB)"
+      echo -e "$title_head\n$title_info"
+      # save the base cmd_stat
+      base_cmd_stat="$cmd_stat"
+    fi
+    if [[ $run_count -eq 0 ]]; then
+      base_cmd_stat="$cmd_stat"
+    fi
+    
+    # show command stats
+    if [ "$last_cmd_stat" != "" ]; then
+      local output_value=""
+      local output_cost=""
+      # TOP10 commands
+      for ((row=0;row<${#ary_top_cmd_name[@]};row++));do
+        local len=7
+        local cmd_name=${ary_top_cmd_name[$row]}
+        if [[ ${#cmd_name} -gt $len ]]; then
+          len=${#cmd_name}
+        fi
+        # calc the avg cost of the command
+        local curr_cost=$(echo -e "$cmd_stat"|grep -w ${cmd_name}|awk '{print $3}')
+        local last_cost=$(echo -e "$last_cmd_stat"|grep -w ${cmd_name}|awk '{print $3}')
+        # calc the increment of the command
+        local curr_value=$(echo -e "$cmd_stat"|grep -w ${cmd_name}|awk '{print $2}')
+        local last_value=$(echo -e "$last_cmd_stat"|grep -w ${cmd_name}|awk '{print $2}')
+        local cmd_value=""
+        local cmd_cost=""
+        if [ "$last_value" = "" ];then
+          cmd_value=$curr_value
+          cmd_cost=$curr_cost
+        elif [ "$curr_value" = "" ]; then
+          cmd_value="0"
+          cmd_cost="0"
+        elif [[ ${last_value} -gt ${curr_value} ]]; then
+          cmd_value=$curr_value
+          cmd_cost=$curr_cost
+        else
+          cmd_value=$((curr_value-last_value))
+          cmd_cost=$((curr_cost-last_cost))
+        fi
+        
+        if [ "$cmd_value" = "" ];then
+          cmd_value="0"
+        fi
+        output_value+=$(printf "%-${len}s " "$cmd_value")
+
+        if [ "$cmd_value" = "0" ];then
+          cmdavgcost="0"
+        else
+          cmdavgcost=$[cmd_cost/cmd_value]
+        fi
+        output_cost+=$(printf "*%-$[len-1]s " "$cmdavgcost")
+      done
+      
+      # TOTAL commands
+      local value=$(echo "$curr_total $last_total"|awk '{if($1>=$2){print $1-$2}else{print $1}}')
+      output_value+=$(printf "%-7s " "$value")
+
+      # %CPU
+      value=$(echo "$curr_cpu $last_cpu $curr_time $last_time"|awk '{if($1>=$2){printf("%-6.1f ",($1-$2)*100/($3-$4)); }else{printf("%-6.1f ",$1*100/($3-$4));}}')
+      output_value+="$value"
+      
+      # CONNECTIONs add
+      value=$(echo "$curr_conn_total $last_conn_total"|awk '{if($1>=$2){print $1-$2}else{print $1}}')
+      output_value+=$(printf "%-5s " "$value")
+
+      # NET input(KB)
+      value=$(echo "$curr_net_input $last_net_input"|awk '{if($1>=$2){print $1-$2}else{print $1}}')
+      output_value+=$(printf "%-7s " "$value")
+      
+      # NET output(KB)
+      value=$(echo "$curr_net_output $last_net_output"|awk '{if($1>=$2){print $1-$2}else{print $1}}')
+      output_value+=$(printf "%-7s\n" "$value")
+      
+      echo "$output_value"
+      if [ "$MONI_LATENCY" = "yes" ];then
+        echo "$output_cost"
+      fi
+    fi
+    
+    # save the last cmd_stat
+    last_cmd_stat="$cmd_stat"
+    last_total=$curr_total
+    last_net_input=$curr_net_input
+    last_net_output=$curr_net_output
+    last_conn_total=$curr_conn_total
+    # last cpu
+    last_cpu=$curr_cpu
+    last_time=$curr_time
+    
+    if [[ $MONI_COUNT -gt 0 && $run_count -ge $MONI_COUNT ]]; then
+      break
+    fi
+    # delay for a while
+    sleep $ROLL_TIME
+    run_count=$((run_count+1))
+  done
+}
+
+#######################################
+# trace command on the sepcify node by 'monitor'
+# Globals:
+#   INPUT_FILE - file with 'monitor' result
+#   REDIS_HOST - redis ip
+#   REDIS_PORT - redis port
+#   CMDS_PREFIX - .RCTOOL-CMDS-
+#   MYPID - pid
+#   AUTH - auth info
+#   TRACE_TIME - running time
+#   TRACE_HOT - analyze the hot keys
+#   TRACE_IP - analyze command by client IP
+# Arguments:
+#   1 - ip
+# Returns:
+#   commands info
+####################################### 
+function trace_commands() {
+  # monitor result:
+  # 1630548595.516774 [0 172.16.17.3:47321] "HGETALL" "REDIS.DBANALYSE.TASK-172.16.17.3"
+  # 1645499579.040001 [0 10.18.130.80:42709] "EVAL" "if redis.call('get',KEYS[1]) == ARGV[1] then redis.call('del',KEYS[1]) return 1 else return 0 end" "1" "LOCK_NEW_54_1" "REQUEST_ID_54"
+  # 1645499579.040022 [0 lua] "exists" "LOCK_NEW_54_1"
+  # 1645499579.040027 [0 lua] "get" "LOCK_NEW_54_1"
+  # 1645499579.040033 [0 lua] "del" "LOCK_NEW_54_1"
+  
+  # stat commands every second: order by command name
+  local awk_cmd_stat='
+    {
+      currsec=substr($1,1,10)
+      if(currsec!=lastsec) {
+        len=asorti(arr,arrsort);
+        for(j=1;j<=len;j++) {
+          msg=msg" "arrsort[j]":"arr[arrsort[j]];
+        }
+        if(msg!="") print strftime("%T", lastsec)">"msg;
+        msg="";
+        lastsec=currsec;
+        delete arr;
+        arr[toupper($4)]=1;
+      } else {
+        ++arr[toupper($4)];
+      }
+    } END {
+      len=asorti(arr,arrsort);
+      for(j=1;j<=len;j++) {
+        msg=msg" "arrsort[j]":"arr[arrsort[j]];
+      }
+      print strftime("%T", lastsec)">"msg;
+    }'
+    
+  if [ "${INPUT_FILE}" != "" ]; then
+    # process command by input file
+    if [ ! -f "${INPUT_FILE}" ]; then
+      warn "Can't load the monitor file: ${INPUT_FILE}!"
+      exit 1
+    fi
+    
+    if [ "${TRACE_HOT}" = "yes" ]; then
+      debug "Analyze the monitor file ${INPUT_FILE} for hot keys ..."
+      # ignore 'EVAL' command: will get KEY from lua subcommand
+      ( echo "================================================== ======= =======";
+        echo "KEY                                                COUNT   PERCENT";
+        echo "-------------------------------------------------- ------- -------";
+        (tail -c +4 ${INPUT_FILE} | grep -iv '"EVAL"' | awk '
+          {
+            arrTmp[$5] += 1;
+            arrKey[$5] += 1;
+            count += 1;
+          } END {
+            len=asort(arrTmp,arrNum)
+            if(len>=100) {
+              top=arrNum[len-100]
+            } else {
+              top=arrNum[1]
+            }
+            for(i in arrKey) {
+              if(arrKey[i]>=top){
+                if(i!=""){
+                  printf("%s %s %0.2f%\n", i, arrKey[i], arrKey[i]*100/count)
+                } else {
+                  printf("NO-KEY %s %0.2f%\n", arrKey[i], arrKey[i]*100/count)
+                }
+              }
+            }
+          }' | sort -k2n,2) 
+        ) | column -t
+    elif [ "${TRACE_IP}" = "yes" ]; then
+      debug "Analyze the monitor file ${INPUT_FILE} for client host ..."
+      # ignore lua subcommand
+      ( echo "========== =============== =======";
+        echo "COMMAND    CLIENTIP        COUNT"; 
+        echo "---------- --------------- -------";
+        (tail -c +4 ${INPUT_FILE} | awk -F'[: ]' '
+          {
+            if($3!="lua]") arr[$5,$3] += 1;
+          } END {
+            for (k in arr) {
+              split(k,idx,SUBSEP);
+              printf("%s %s %s\n",idx[1], idx[2],arr[idx[1],idx[2]]);
+            }
+          }' | sort -k1,1 -k3n,3)
+      ) | column -t
+    else
+      debug "Analyze the monitor file ${INPUT_FILE} on seconds ..."
+      echo "--------------------------------------------------------------------------------"
+      tail -c +4 ${INPUT_FILE} | awk "$awk_cmd_stat"
+    fi
+  else
+    # check redis status
+    check_redis_by_ping
+    
+    INPUT_FILE="${REDIS_HOST}-${REDIS_PORT}.mon"
+    rm -rf ${INPUT_FILE}
+    redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} $AUTH monitor >${INPUT_FILE} &
+    local cli_pid=$!
+    local cli_exist=$(ps -p $cli_pid | grep redis-cli |wc -l)
+    if [ "$cli_exist" = "0" ]; then
+      warn "Can't connect to the node ${REDIS_HOST}:${REDIS_PORT}!"
+      exit 1
+    fi
+    
+    debug "Analyze the command on seconds for the node ${REDIS_HOST}:${REDIS_PORT} ..."
+    echo "--------------------------------------------------------------------------------"
+    # wait for ${INPUT_FILE} created
+    for i in {1..50}
+    do
+      sleep 0.1
+      if [ -f "${INPUT_FILE}" ]; then
+        tail -c +4 -f ${INPUT_FILE} | awk "$awk_cmd_stat" &
+        # wait for TRACE_TIME to exit.
+        sleep ${TRACE_TIME}
+        break;
+      fi
+    done
+
+    # Kill all sub processes
+    local all_pids=$(ps --ppid $$ | awk '{if($4~/redis-cli|tail/) print $1}')
+    if [ "$all_pids" != "" ]; then
+      kill $all_pids
+    fi
+    debug "You can check the monitor file: [${INPUT_FILE}], or analyze the file by -f again!"
+  fi
+}
+
+#######################################
+# parse node slowlog by ip
+# Globals:
+#   NODES_LIST - cluster nodes list
+#   REDIS_HOST - redis ip
+#   NODES_PREFIX - .RCTOOL-NODES-
+#   SLOWLOG_PREFIX - .RCTOOL-SLOWLOG-
+#   MYPID - pid
+#   AUTH - auth info
+#   SLOW_COUNT - count of slowlog
+# Arguments:
+#   1 - ip
+# Returns:
+#   slowlog
+####################################### 
+function subprocess_slowlog_by_ip() {
+  local deal_ip=$1
+  
+  # awk scripts: parse slowlog 
+  local awk_slowlog='
+    BEGIN { 
+      id=-1;
+      time=0;
+      duration=0;
+      cmd="";
+      client="\"\"";
+      name="\"\"";
+      step=0;
+      splen=0;
+      spprefix="";
+    }
+    {
+      if ($3 == "(integer)") {
+        if (id >= 0) {
+          print id,time,duration,client,name,cmd;
+        } else {
+          splen = index($0, "(");
+          for(i=1;i<splen;i++){
+            spprefix=spprefix" ";
+          }
+        }
+        id = $4;
+        step = 1;
+      } else if (step == 1) {
+        time = strftime("%Y%m%d%H%M%S", $3);
+        step = 2;
+      } else if (step == 2) {
+        duration = $3;
+        step = 3;
+      } else if (step == 3) {
+        cmd = $3;
+        step = 4;
+      } else if (step == 4) {
+        prefix=substr($0,1,splen-1)
+        if (prefix == spprefix) {
+          for(i=2;i<=NF;i++) {
+            cmd = cmd" "$i;
+          }
+        } else {
+          client = $2;
+          step = 5;
+        }
+      } else if (step == 5) {
+        name = $2;
+        step = 6;
+      }
+    } 
+    END { 
+      if (id >= 0) {
+        print id,time,duration,client,name,cmd;
+      }
+    }'
+  # init result file
+  local ret_file="${SLOWLOG_PREFIX}${deal_ip}.${MYPID}"
+  local prog_file="${NODES_PREFIX}${deal_ip}.${MYPID}"
+  >$ret_file
+  >$prog_file
+  for node_addr in $(echo "$NODES_LIST"|grep $deal_ip); do
+    # ADDR
+    local node_ip=${node_addr%:*}
+    local node_port=${node_addr##*:}
+    if [ "$node_ip" = "127.0.0.1" -o "$node_ip" = "" ]; then
+      node_ip=${REDIS_HOST}
+    fi
+    
+    local node_slowlog=$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} --no-raw slowlog get $SLOW_COUNT 2>/dev/null)
+    if [ $? -ne 0 ]; then
+      warn "Can't connect to redis(${node_ip}:${node_port})!\n"
+    elif [ "$node_slowlog" != "(empty list or set)" ]; then
+    	echo "$node_slowlog"|awk "$awk_slowlog"|awk '{print "'$node_ip:$node_port' "$0}' >> ${ret_file}
+    fi
+    
+    echo 1 >>$prog_file
+  done
+}
+
+#######################################
+# get cluster slowlog
+# Globals:
+#   NODES_LIST - cluster nodes list
+#   REDIS_HOST - redis ip
+#   REDIS_PORT - redis port
+#   SLOWLOG_PREFIX - .RCTOOL-SLOWLOG-
+#   MYPID - pid
+#   AUTH - auth info
+#   SLOW_COUNT - count of slowlog
+#   SINGLE_NODE - process the specify node only
+# Arguments:
+#   1 - ip
+# Returns:
+#   slowlog
+####################################### 
+function get_slowlogs() {
+	# CLUSTER or SINGLE
+  if [ "$SINGLE_NODE" != "yes" ]; then
+    # NODES_LIST
+    get_cluster_nodes
+    debug "[CLUSTER] get slowlog of cluster by the node ${REDIS_HOST}:${REDIS_PORT} (COUNT=${SLOW_COUNT})"
+  else
+    check_redis_by_ping
+    NODES_LIST="${REDIS_HOST}:${REDIS_PORT}"
+    debug "[SINGLE] get slowlog of node ${REDIS_HOST}:${REDIS_PORT} (COUNT=${SLOW_COUNT})"
+  fi
+  
+  local last_ip="Nil"
+  for node in $(echo "$NODES_LIST"|sort); do
+    # ip
+    local ip=${node%:*}
+    if [ "$last_ip" != "$ip" ]; then
+      last_ip=$ip
+      {
+        subprocess_slowlog_by_ip $last_ip
+      }&
+    fi
+  done
+  # show progress
+  show_progress "$NODES_LIST"
+  # wait subprocess done
+  wait
+
+  local width=108
+  draw_divide_line $width "=" "$(date +' %F %T ')"
+  printf "%-21s %-6s %-15s %-12s %-21s %s\n" "Redis" "ID" "Time[Asc]" "Duration(us)" "Client" "Command"
+  draw_divide_line $width "-"
+  # show the slowlogs order by time
+  local awk_slog_show='
+    BEGIN { 
+      lastdate="";
+      count=0;
+    }
+    {
+    	currdate = substr($3,1,8)
+    	if(lastdate != currdate)
+    	{
+    		if(lastdate != "")
+    		{
+    			printf("---------------------------[ %s:       count = %s ]-------------------------------------------------\n", lastdate, count);
+    		}
+    		lastdate=currdate
+    		count=0;
+    	}
+      printf("%-21s %-6s %-15s %-12s %-21s [ ",$1,$2,$3,$4,substr($5,2,length($5)-2));
+      for(i=7;i<=NF;i++) 
+      {
+        printf("%s ",$i);
+      }
+      printf("]\n");
+      count+=1;
+    } END {
+    	if(lastdate != "")
+    	{
+    		printf("---------------------------[ %s:       count = %s ]-------------------------------------------------\n", lastdate, count);
+    	} else {
+    	  print "(no slow log)"
+    	}
+    }'
+  # 172.16.17.3:7290 27 20201202084309 50 "10.45.80.253:33788" "JavaClient" "INFO" "commandstats"
+  cat ${SLOWLOG_PREFIX}*.${MYPID} 2>/dev/null | sort -k 3n -k 2n | awk "$awk_slog_show"
+}
+
+#######################################
+# key prefix stat by file
+# Globals:
+#   INPUT_FILE - key file name
+#   PREFIX_LVL - prefix level
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function keyfile_stat() {
+  if [ ! -f "$INPUT_FILE" ]; then
+    warn "File not exist: $INPUT_FILE"
+    exit 1
+  fi
+  # 因为centos7中sort命令只会对字母和数字进行排序(使用-i参数也不能使其他可见字符参与排序)
+  # 为了实现能按前缀层级排序，就使用了0来临时作为连接符(0是排序字符中最小的)
+  # 排序完成后再使用awk命令将连接符调整为冒号(:)，然后通过column命令进行表格化对齐
+  # 最后使用awk命令来美化TITLE字段以及高亮显示部分层级
+  (echo -e "==========,========,========\n KEY_PREFIX,COUNT,PERCENT\n----------,--------,--------"; 
+   cat $INPUT_FILE | awk '{print $1}' | awk -v level=$PREFIX_LVL  -F'[_:.$|-]' '
+    {   
+      count+=1;
+      if($0 ~ /^[\x20-\x7E]+$/) {
+        gsub(/[\x30-\x38]/,"9");
+        for ( i = 1; i <= level && NF >=i; i++ ) {
+          if (i == 1)
+            prefix=$i;
+          else 
+            prefix=prefix"0"$i;
+          switch(i) {
+            case 1:
+              x1[prefix]+=1;
+              break;
+            case 2:
+              x2[prefix]+=1;
+              break;
+            case 3:
+              x3[prefix]+=1;
+              break;
+            case 4:
+              x4[prefix]+=1;
+              break;
+            case 5:
+              x5[prefix]+=1;
+              break;
+            case 6:
+              x6[prefix]+=1;
+              break;
+          }
+        }
+      }
+    } END {
+        for ( value in  x1 ) {
+          perc=100*x1[value]/count;
+          if(perc>=70) {
+            printf(" %s:,%s,\033[31;4m%.2f%%\033[0m\n", value, x1[value], perc);
+          } else {
+            printf(" %s:,%s,%.2f%%\n", value, x1[value], perc);
+          }
+        }
+        for ( value in  x2 ) {
+          perc=100*x2[value]/count;
+          if(perc>=60) {
+            printf("  |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x2[value], perc);
+          } else {
+            printf("  |- %s,%s,%.2f%%\n", value, x2[value], perc);
+          }
+        }
+        for ( value in  x3 ) {
+          perc=100*x3[value]/count;
+          if(perc>=50) {
+            printf("      |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x3[value], perc);
+          } else {
+            printf("      |- %s,%s,%.2f%%\n", value, x3[value], perc);
+          }
+        }
+        for ( value in  x4 ) {
+          perc=100*x4[value]/count;
+          if(perc>=40) {
+            printf("          |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x4[value], perc);
+          } else {
+            printf("          |- %s,%s,%.2f%%\n", value, x4[value], perc);
+          }
+        }
+        for ( value in  x5 ) {
+          perc=100*x5[value]/count;
+          if(perc>=30) {
+            printf("              |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x5[value], perc);
+          } else {
+            printf("              |- %s,%s,%.2f%%\n", value, x5[value], perc);
+          }
+        }
+        for ( value in  x6 ) {
+          perc=100*x6[value]/count;
+          if(perc>=20) {
+            printf("                  |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x6[value], perc);
+          } else {
+            printf("                  |- %s,%s,%.2f%%\n", value, x6[value], perc);
+          }
+        }
+    }' \
+    | sort -t ',' -k1,1 ) \
+    | awk -F',' -v OFS=',' '{gsub(/0/,":",$1);gsub(/9/,"0",$1);print $0}' \
+    | column -t -s ',' -o ' | ' | awk -F'|' '
+        {
+          if(NR==1) {
+            gsub(/[ |]/,"=");
+            len=length($0);
+            print
+          } else if(NR==3) {
+            gsub(/ /,"-");
+            print
+          } else {
+            if(NR==2 || substr($0,1,2)=="  ") {
+              print
+            } else {
+              printf("\033[42;30m%s\033[0m\n",$0)
+            }
+          }
+        } END {
+          for(i=1;i<=len;i++) {
+            printf("=");
+          }
+          printf("\n");
+        }'
+}
+
+#######################################
+# get key list from redis server
+# Globals:
+#   INPUT_FILE - key file name
+#   REDIS_HOST - redis server ip
+#   REDIS_PORT - redis server port
+#   KEYS_COUNT  - max keys get from server
+#   AUTH - password option
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function get_keys() {
+  if [ "$INPUT_FILE" = "" ]; then
+    # check redis status
+    check_redis_by_ping
+    
+    INPUT_FILE="${REDIS_HOST}-${REDIS_PORT}.keys"
+    
+    touch ${INPUT_FILE}
+    redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} --scan >${INPUT_FILE} &
+    local subpid=$!
+    local loguser=$(id -un)
+    local loop=0
+    local count=0
+    local subexist=1
+    while [ 1 ]; do
+      sleep 0.5
+      subexist=$(ps -fu $loguser | grep redis-cli | awk -v pid=$subpid '{if($2==pid){print "1"}}' | wc -l)
+      if [[ $subexist -eq 0 ]]; then
+        break
+      fi
+      # check keys enough
+      count=$(cat ${INPUT_FILE} | wc -l)
+      if [[ $KEYS_COUNT -gt 0 && $KEYS_COUNT -le $count ]]; then
+        kill $subpid
+        break
+      fi
+      loop=$((loop+1))
+      printf "Time elapsed $((loop/2)) (s): $count\r"
+    done
+    wait
+    count=$(cat ${INPUT_FILE} | wc -l)
+    printf "Time elapsed $((loop/2)) (s): $count\n"
+  fi
+}
+
+#######################################
+# parse options
+# Globals:
+#   REDIS_HOST - redis server ip
+#   REDIS_PORT - redis server port
+#   REDIS_PASS - redis server password
+#   KEYS_COUNT  - max keys get from server
+#   MONI_COUNT - times of monitor updates
+#   SLOW_COUNT - count of slowlog to get
+#   ROLL_TIME - monitor delay time in seconds
+#   SINGLE_NODE - single node only
+#   MONI_LATENCY - show average latency on moni
+#   TRACE_TIME - the running time on trace
+#   INPUT_FILE - input file name
+#   PREFIX_LVL - prefix level
+#   TRACE_HOT - analyze the hot keys
+#   TRACE_IP - stat commands by cient host
+#   OUTPUT_RAW_DATA - output raw data of nodes
+#   CONFIG_KEY - config name to get/set
+#   CONFIG_VALUE - config value to get/set
+#   CONFIG_SET - config set value
+#   ROLE_TYPE - node role type: master,slave,all
+#   WRITE_CONFIG - rewrite config file after set
+#   USAGE - help message
+#   CMD - sub command
+#   AUTH - auth parameter
+# Arguments:
+#   command line
+# Returns:
+#   None
+#######################################
+function main() {
+  trap "exitup" INT TERM
+  trap "cleanup" EXIT
+  # use nawk by default
+  if [ -f /usr/bin/nawk ]; then alias awk=nawk ;fi
+  shopt -s expand_aliases
+  
+  if [[ $# -eq 0 ]]; then
+    echo -e "$USAGE"
+    exit 2
+  fi
+
+  while getopts "h:p:a:d:c:t:f:L:k:v:HCslrMSw" arg
+  do
+    case $arg in
+      h)  # redis ip
+        REDIS_HOST="$OPTARG"
+        ;;
+      p)  # redis port
+        REDIS_PORT="$OPTARG"
+        ;;
+      a)  # redis password
+        REDIS_PASS="$OPTARG"
+        ;;
+      c)  # number of monitor/slowlog/keys
+        assert_int "$OPTARG" "c"        
+        MONI_COUNT="$OPTARG"
+        SLOW_COUNT="$OPTARG"
+        KEYS_COUNT="$OPTARG"
+        ;;
+      d)  # monitor delay time in seconds
+        ROLL_TIME="$OPTARG"
+        ;;
+      s)  # single only
+        SINGLE_NODE="yes"
+        ;;
+      l)  # show average latency
+        MONI_LATENCY="yes"
+        ;;
+      t)  # the running time on trace
+        assert_int "$OPTARG" "t"
+        TRACE_TIME="$OPTARG"
+        # running max time = 600 seconds
+        if [[ ${TRACE_TIME} -gt 600 ]];then
+          TRACE_TIME=600
+        fi
+        ;;
+      f)  # monitor/keys file
+        INPUT_FILE="$OPTARG"
+        ;;
+      L)  # prefix level
+        assert_int "$OPTARG" "L"
+        PREFIX_LVL="$OPTARG"
+        if [[ $PREFIX_LVL -le 0 ]];then
+            PREFIX_LVL=1;
+        fi
+        ;;
+      H)  # analyze the hot keys
+        TRACE_HOT="yes"
+        ;;
+      C)  # stat commands by cient host
+        TRACE_IP="yes"
+        ;;
+      r)  # output raw data of nodes
+        OUTPUT_RAW_DATA="yes"
+        ;;
+      k)  # config name to get/set
+        CONFIG_KEY="$OPTARG"
+        ;;
+      v)  # config value to set
+        CONFIG_VALUE="$OPTARG"
+        CONFIG_SET="yes"
+        ;;
+      M)  # master type
+        ROLE_TYPE="master"
+        ;;
+      S)  # master type
+        ROLE_TYPE="slave"
+        ;;
+      w)  # rewrite config file
+        WRITE_CONFIG="yes"
+        ;;
+      ?)  # unknown options, show usage
+        echo -e "$USAGE"
+        exit 1
+        ;;
+    esac
+  done
+  # remove options dealed
+  shift $((OPTIND-1))
+  
+  # check options
+  if [[ $# -gt 2 ]]; then
+    echo -e "$USAGE"
+    exit 2
+  elif [[ $# -eq 1 ]]; then
+    CMD="$1"
+  fi
+
+  # check redis-cli to be useful
+  check_redis_cli
+  # set REDISCLI_AUTH
+  set_rediscli_auth
+  
+  case $CMD in
+    config)
+      setget_config
+      ;;
+    keys)
+      # get keys from server
+      get_keys
+      # stat keys in file
+      keyfile_stat
+      ;;
+    moni)
+      moni_commands
+      ;;
+    nodes)
+      get_cluster_status
+      ;;
+    slowlog)
+      get_slowlogs
+      ;;
+    trace)
+      trace_commands
+      ;;
+    *)
+      warn "Invalid subcommand '$CMD'"
+      echo -e "$USAGE"
+      exit 1
+  esac
+}
+
+############################################ main #################################################
+main $@
