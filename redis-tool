@@ -361,6 +361,7 @@ function setget_config() {
     local conf_val=""
     local node_count=$(echo "$CLUSTER_NODES_ALL"|grep "$ROLE_TYPE"|wc -l)
     debug "Audit the config with diffrent value on \033[37m${ROLE_TYPE:-all}(count=$node_count)\033[0m nodes:"
+    local proc_count=0
     for node in $(echo "$CLUSTER_NODES_ALL"|grep "$ROLE_TYPE"|grep -v noaddr|awk '{print $4}'|sort); do
       # ip & port
       local node_ip=${node%:*}
@@ -381,6 +382,15 @@ function setget_config() {
         map_config[$conf_key]="${map_config[$conf_key]}${conf_val}\n"
       done        
       IFS=$OLDIFS
+      # show progress barcursor
+      if [[ $node_count -gt 20 ]]; then
+        proc_count=$((proc_count+1))
+        show_bar "TOTAL:$node_count" $node_count $proc_count
+        if [[ $node_count -gt $proc_count ]]; then
+          # reset cursor
+          echo -ne "\033[1A\r"
+        fi
+      fi
     done
     
     # audit the config values
