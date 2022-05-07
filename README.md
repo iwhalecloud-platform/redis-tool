@@ -16,13 +16,21 @@ Redis Cluster Daily Maintenance Tool/Redis集群日常运维工具
 redis-tool工具使用shell脚本实现，下载到具有redis-cli工具的主机上即可使用（通常可部署到redis服务主机上）。
 
 ```bash
-# 1. 从github下载redis-tool工具，以下分别使用git和wget进行下载
+# 1. 从github下载redis-tool工具
+# 方法一：使用git下载
 $ git clone https://github.com/iwhalecloud-platform/redis-tool.git
+# 进入安装目录
+$ cd redis-tool
+# 方法二：使用wget下载
 $ wget https://github.com/iwhalecloud-platform/redis-tool/archive/refs/heads/main.zip
-# 2. 工具增加可执行权限
-$ chmod +x redis-tool
-# 3. 设置REDIS_HOME环境变量为redis-cli工具所在目录（如果PATH环境变量中包含该目录，则该步可省略）
-$ export REDIS_HOME=/path/to/redis-cli/
+# 解压工具包&修改目录名
+$ unzip main.zip && mv redis-tool-main redis-tool
+# 进入安装目录
+$ cd redis-tool
+
+# 2. 设置REDIS_HOME环境变量为redis-cli工具所在目录（如果PATH环境变量中包含该目录，则该步可省略）
+$ echo "export REDIS_HOME=/path/to/redis-cli/" >> ~/.bashrc
+$ source ~/.bashrc
 ```
 
 ## 使用帮助
