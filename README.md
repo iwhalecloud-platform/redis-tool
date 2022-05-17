@@ -19,13 +19,13 @@ redis-tool工具使用shell脚本实现，下载到具有redis-cli工具的主�
 # 1. 从github下载redis-tool工具
 # 方法一：使用git下载
 $ git clone https://github.com/iwhalecloud-platform/redis-tool.git
-# 进入安装目录
+# 进入下载目录
 $ cd redis-tool
 # 方法二：使用wget下载
 $ wget https://github.com/iwhalecloud-platform/redis-tool/archive/refs/heads/main.zip
 # 解压工具包&修改目录名
 $ unzip main.zip && mv redis-tool-main redis-tool
-# 进入安装目录
+# 进入下载目录
 $ cd redis-tool
 
 # 2. 设置REDIS_HOME环境变量为redis-cli工具所在目录（如果PATH环境变量中包含该目录，则该步可省略）
@@ -47,7 +47,7 @@ OPTIONS:
    -c <count>:    1. TOP10命令统计滚动展示次数(默认无限次, 'moni'使用).
                   2. 从Redis节点中获取的慢命令记录数(默认值: 100, 'slowlog'使用).
                   3. 从Redis节点中随机获取的KEY名称数量(默认值: 100000, 'keys'使用).
-   -d <delay>:    TOP10命令统计滚动展示等待间隔(单位: 秒, 默认值: 3, used by 'moni'使用).
+   -d <delay>:    TOP10命令统计滚动展示等待间隔(单位: 秒, 默认值: 3, 'moni'使用).
    -t <time>:     实时命令监控跟踪运行时长(单位: 秒, 默认值: 10, 'trace'使用).
    -s:            只处理指定Redis节点('moni' & 'slowlog'使用).
    -l:            TOP10命令统计滚动展示包含命令执行平均处理耗时('moni'使用).
@@ -314,7 +314,7 @@ Time elapsed 0 (s): 45
 =============================================
 ```
 
-
+**备注**：KEY前缀连接符统一使用`:`进行代替
 
 ### 配置参数管理
 
