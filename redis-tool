@@ -1488,7 +1488,7 @@ function keyfile_stat() {
   fi
   # 因为centos7中sort命令只会对字母和数字进行排序(使用-i参数也不能使其他可见字符参与排序)
   # 为了实现能按前缀层级排序，就使用了0来临时作为连接符(0是排序字符中最小的)
-  # 排序完成后再使用awk命令将连接符调整为冒号(:)，然后通过column命令进行表格化对齐
+  # 排序完成后再使用awk命令将连接符调整为冒号(.)，然后通过column命令进行表格化对齐
   # 最后使用awk命令来美化TITLE字段以及高亮显示部分层级
   (echo -e "==========,========,========\n KEY_PREFIX,COUNT,PERCENT\n----------,--------,--------"; 
    cat $INPUT_FILE | awk '{print $1}' | awk -v level=$PREFIX_LVL  -F'[_:.$|-]' '
@@ -1574,7 +1574,7 @@ function keyfile_stat() {
         }
     }' \
     | sort -t ',' -k1,1 ) \
-    | awk -F',' -v OFS=',' '{gsub(/0/,":",$1);gsub(/9/,"0",$1);print $0}' \
+    | awk -F',' -v OFS=',' '{gsub(/0/,".",$1);gsub(/9/,"0",$1);print $0}' \
     | column -t -s ',' -o ' | ' | awk -F'|' '
         {
           if(NR==1) {
