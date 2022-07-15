@@ -70,9 +70,6 @@ MONI_COUNT=-1
 SLOW_COUNT=100
 # KEYS_COUNT: count of keys to stat by prefix: default 100000
 KEYS_COUNT=100000
-# CMD: subcommand: default 'nodes'
-CMD="nodes"
-
 
 ####################### function ########################
 
@@ -463,7 +460,7 @@ function setget_config() {
         if [[ $WRITE_CONFIG = "yes" && "$conf_res" = "OK" ]]; then
           conf_res="write config file: "$(redis-cli -h ${node_ip} -p ${node_port} ${AUTH} config rewrite 2>&1)
         fi
-        debug "[${node_ip}:${node_port}]: CONFIG SET $CONFIG_KEY $CONFIG_VALUE : [$conf_res]"
+        debug "[${node_ip}:${node_port}]: CONFIG SET $CONFIG_KEY '$CONFIG_VALUE' : [$conf_res]"
       fi
       
       # CONFIG GET
@@ -1775,6 +1772,17 @@ function main() {
     exit 2
   elif [[ $# -eq 1 ]]; then
     CMD="$1"
+  fi
+  
+  if [[ "$CMD" = "" ]]; then
+    if [[ "$CONFIG_SET" = "yes" && "$CONFIG_VALUE" = "config" ]]; then
+      # Fit: config set parameter ""
+      CMD="config"
+      CONFIG_VALUE=""
+    else
+      # subcommand: default 'nodes'
+      CMD="nodes"
+    fi
   fi
 
   # check redis-cli to be useful
