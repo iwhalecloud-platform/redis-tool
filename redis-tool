@@ -70,6 +70,8 @@ MONI_COUNT=-1
 SLOW_COUNT=100
 # KEYS_COUNT: count of keys to stat by prefix: default 100000
 KEYS_COUNT=100000
+# CMD: subcommand: default 'nodes'
+CMD="nodes"
 
 ####################### function ########################
 
@@ -1772,17 +1774,6 @@ function main() {
     exit 2
   elif [[ $# -eq 1 ]]; then
     CMD="$1"
-  fi
-  
-  if [[ "$CMD" = "" ]]; then
-    if [[ "$CONFIG_SET" = "yes" && "$CONFIG_VALUE" = "config" ]]; then
-      # Fit: config set parameter ""
-      CMD="config"
-      CONFIG_VALUE=""
-    else
-      # subcommand: default 'nodes'
-      CMD="nodes"
-    fi
   fi
 
   # check redis-cli to be useful
