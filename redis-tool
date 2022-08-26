@@ -8,6 +8,9 @@ readonly USAGE="Usage: $(basename $0) [OPTIONS] [command]
 OPTIONS:
    -h <IP>:       Redis hostname (default: 127.0.0.1).
    -p <port>:     Redis port (default: 6379).
+   -i <nodefile>: Cluster nodes file. File format: 
+                  <slots1> <MasterAddr> [SlaveAddr] [SlaveAddr]
+                  <slots2> <MasterAddr> [SlaveAddr] [SlaveAddr]
    -a <password>: Password to use when connecting to redis.
                   You can also use the REDISCLI_AUTH environment
                   variable to pass this password more safely.
@@ -72,6 +75,8 @@ SLOW_COUNT=100
 KEYS_COUNT=100000
 # CMD: subcommand: default 'nodes'
 CMD="nodes"
+# DATABASE: redis database: default 0
+DATABASE=0
 
 ####################### function ########################
 
@@ -91,11 +96,11 @@ function exitup() {
 }
 # print info message
 function debug() { 
-  echo -e "$(date +'%F %T') \033[37m<INFO>\033[0m "$@
+  echo -e "$(date +'%F %T') \033[37m<INFO>\033[0m $@"
 }
 # print warning message
 function warn() { 
-  echo -e "$(date +'%F %T') \033[31m<WARN>\033[0m "$@
+  echo -e "$(date +'%F %T') \033[31m<WARN>\033[0m $@"
 }
 # check version
 function version_ge() { 
@@ -181,21 +186,23 @@ function set_rediscli_auth() {
 function get_cluster_nodes() {
   # ID ip:port flags masterID pingtime pongtime configepoch connect slots
   local nodes_res=""
-  nodes_res=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} cluster nodes 2>&1)
-  if [[ $? -eq 0 && "${nodes_res:0:8}" != "LOADING " && "${nodes_res:0:7}" != "NOAUTH " ]]; then
-    # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
-    CLUSTER_NODES_ALL=$(echo "$nodes_res"|awk '{if($4=="-"){print $1" master "$0}else{print $4" slave "$0}}'|sort)
-  fi
   if [[ ${#CLUSTER_NODES_ALL} -eq 0 ]]; then
-    warn "Access redis(${REDIS_HOST}:${REDIS_PORT}) failed: \033[41;37m${nodes_res}\033[0m"
-    if [ "${nodes_res:0:7}" == "NOAUTH " ]; then
-      warn "Please input redis password by option '-a <password>'!"
-    elif [ "${nodes_res:0:8}" == "LOADING " ]; then
-      warn "Please retry the command after LOADING finished!"
-    else
-      warn "Please input active redis by option '-h <ip> -p <port>'!"
+    nodes_res=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} cluster nodes 2>&1)
+    if [[ $? -eq 0 && "${nodes_res:0:8}" != "LOADING " && "${nodes_res:0:7}" != "NOAUTH " ]]; then
+      # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
+      CLUSTER_NODES_ALL=$(echo "$nodes_res"|awk '{if($4=="-"){print $1" master "$0}else{print $4" slave "$0}}'|sort)
     fi
-    exit 1
+    if [[ ${#CLUSTER_NODES_ALL} -eq 0 ]]; then
+      warn "Access redis(${REDIS_HOST}:${REDIS_PORT}) failed: \033[41;37m${nodes_res}\033[0m"
+      if [ "${nodes_res:0:7}" == "NOAUTH " ]; then
+        warn "Please input redis password by option '-a <password>'!"
+      elif [ "${nodes_res:0:8}" == "LOADING " ]; then
+        warn "Please retry the command after LOADING finished!"
+      else
+        warn "Please input active redis by option '-h <ip> -p <port>'!"
+      fi
+      exit 1
+    fi
   fi
   # cut cluster port from node addr
   CLUSTER_NODES_ALL=$(echo "$CLUSTER_NODES_ALL"|sed -re 's/@[0-9]*//g')
@@ -1487,7 +1494,7 @@ function keyfile_stat() {
   fi
   # 因为centos7中sort命令只会对字母和数字进行排序(使用-i参数也不能使其他可见字符参与排序)
   # 为了实现能按前缀层级排序，就使用了0来临时作为连接符(0是排序字符中最小的)
-  # 排序完成后再使用awk命令将连接符调整为冒号(.)，然后通过column命令进行表格化对齐
+  # 排序完成后再使用awk命令将连接符调整为点号(.)，然后通过column命令进行表格化对齐
   # 最后使用awk命令来美化TITLE字段以及高亮显示部分层级
   (echo -e "==========,========,========\n KEY_PREFIX,COUNT,PERCENT\n----------,--------,--------"; 
    cat $INPUT_FILE | awk '{print $1}' | awk -v level=$PREFIX_LVL  -F'[_:.$|-]' '
@@ -1619,7 +1626,7 @@ function get_keys() {
     INPUT_FILE="${REDIS_HOST}-${REDIS_PORT}.keys"
     
     touch ${INPUT_FILE}
-    redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} --scan >${INPUT_FILE} &
+    redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} -n ${DATABASE} --scan >${INPUT_FILE} &
     local subpid=$!
     local loguser=$(id -un)
     local loop=0
@@ -1645,6 +1652,53 @@ function get_keys() {
     printf "Time elapsed $((loop/2)) (s): $count\n"
   fi
 }
+
+#######################################
+# get cluster nodes from file
+# Globals:
+#   CLUSTER_NODES_ALL - cluster nodes list
+#   REDIS_PORT - redis port
+#   REDIS_PASS - redis password
+# Arguments:
+#   None
+# Returns:
+#   None
+####################################### 
+function get_nodes_by_file() {
+  if [[ -n "${NODES_FILE}" ]]; then
+    # load cluster nodes file
+    if [ ! -f "${NODES_FILE}" ]; then
+      warn "Can't load the cluster nodes file: ${NODES_FILE}!"
+      exit 1
+    fi
+    local awk_cmd='
+    {
+      slots=$1
+      master=$2
+      if(master!=""){
+        print master,"master",master,master,"master","-","pingtime","pongtime","poch","connected",slots
+        for(i=3;i<=NF;i++){
+          print master,"slave",$i,$i,"slave",master,"pingtime","pongtime","poch","connected"
+        }
+      }
+    }'
+    CLUSTER_NODES_ALL=$(cat $NODES_FILE | awk "$awk_cmd")
+    if [[ -z "$CLUSTER_NODES_ALL" ]]; then
+      warn "Invalid nodes file: '${NODES_FILE}'\n"\
+           "Format:\n"\
+           "  <slots1> <MasterAddr> [SlaveAddr]\n"\
+           "Example:\n"\
+           "  1 10.10.10.1:6379 10.10.10.2:6379\n"\
+           "  2 10.10.10.2:6380 10.10.10.1:6380"
+      exit 2
+    fi
+    local master
+    master=$(echo "$CLUSTER_NODES_ALL" | head -1 | awk '{print $1}')
+    REDIS_HOST=${master%:*}
+    REDIS_PORT=${master##*:}   
+  fi
+}
+
 
 #######################################
 # parse options
@@ -1689,7 +1743,7 @@ function main() {
     exit 2
   fi
 
-  while getopts "h:p:a:d:c:t:f:L:k:v:HCslrMSw" arg
+  while getopts "h:p:n:i:a:d:c:t:f:L:k:v:HCslrMSw" arg
   do
     case $arg in
       h)  # redis ip
@@ -1697,6 +1751,13 @@ function main() {
         ;;
       p)  # redis port
         REDIS_PORT="$OPTARG"
+        ;;
+      i)  # input cluster nodes file
+        NODES_FILE="$OPTARG"
+        ;;
+      n)  # database: used by 'keys' command
+        assert_int "$OPTARG" "n"
+        DATABASE="$OPTARG"
         ;;
       a)  # redis password
         REDIS_PASS="$OPTARG"
@@ -1780,6 +1841,8 @@ function main() {
   check_redis_cli
   # set REDISCLI_AUTH
   set_rediscli_auth
+  # get cluster nodes from $NODES_FILE
+  get_nodes_by_file
   
   case $CMD in
     config)
