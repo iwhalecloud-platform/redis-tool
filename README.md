@@ -43,6 +43,8 @@ Usage: redis-tool [OPTIONS] [command]
 OPTIONS:
    -h <IP>:       Redis集群中某个节点IP (默认值: 127.0.0.1).
    -p <port>:     Redis集群中某个节点端口 (默认值: 6379).
+   -i <nodefile>: Redis集群节点信息文件(适配codis等基于PROXY构建的集群模式).
+                  文件格式(每行一个分片)：<slots1> <MasterAddr> [SlaveAddr] [SlaveAddr]
    -a <password>: Redis访问密码，也可使用'REDISCLI_AUTH'环境变量来传入.
    -c <count>:    1. TOP10命令统计滚动展示次数(默认无限次, 'moni'使用).
                   2. 从Redis节点中获取的慢命令记录数(默认值: 100, 'slowlog'使用).
@@ -78,7 +80,7 @@ command:
 <span style='color:red'>**注意事项**：</span>
 
 1. 请提前设置<span style='color:red'>REDIS_HOME</span>环境变量为redis-cli工具所在目录（如果`PATH`环境变量中包含该目录，可省略）
-2. 建议使用<span style='color:red'>REDISCLI_AUTH</span>环境变量来传入Redis访问密码
+2. 强烈建议使用<span style='color:red'>REDISCLI_AUTH</span>环境变量来传入Redis访问密码（Redis高版本时务必使用该方式）
 
 ### Redis集群监控
 
