@@ -596,7 +596,7 @@ function subprocess_nodes_by_ip() {
         ops=$(echo "$node_info"|awk -F":|\r" '{if($1=="instantaneous_ops_per_sec"){print $2}}')
         clients=$(echo "$node_info"|awk -F":|\r" '{if($1=="connected_clients"){print $2}}')
         # db0:keys=5001,expires=0,avg_ttl=0
-        keynum=$(echo "$node_info"|awk -F":|=|,|\r" '{if($1=="db0"){print $3}}')
+        keynum=$(echo "$node_info"|awk -F":|=|,|\r" '{if($1 ~ /^db[0-9]*/){keys+=$3}} END {print keys}')
         if [ "$keynum" = "" ]; then
           keynum="0"
         fi
