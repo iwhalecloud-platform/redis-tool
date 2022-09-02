@@ -80,7 +80,7 @@ command:
 <span style='color:red'>**注意事项**：</span>
 
 1. 请提前设置<span style='color:red'>REDIS_HOME</span>环境变量为redis-cli工具所在目录（如果`PATH`环境变量中包含该目录，可省略）
-2. 强烈建议使用<span style='color:red'>REDISCLI_AUTH</span>环境变量来传入Redis访问密码（Redis高版本时务必使用该方式）
+2. 强烈建议使用<span style='color:red'>REDISCLI_AUTH</span>环境变量来传入Redis访问密码
 
 ### Redis集群监控
 
