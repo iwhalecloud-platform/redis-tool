@@ -1492,21 +1492,21 @@ function keyfile_stat() {
     warn "File not exist: $INPUT_FILE"
     exit 1
   fi
-  # 因为centos7中sort命令只会对字母和数字进行排序(使用-i参数也不能使其他可见字符参与排序)
-  # 为了实现能按前缀层级排序，就使用了0来临时作为连接符(0是排序字符中最小的)
-  # 排序完成后再使用awk命令将连接符调整为点号(.)，然后通过column命令进行表格化对齐
+  # 需要设置export LC_ALL=C，这样sort才能正确的按ASCII字符排序
+  # 统一使用点号(.)作为连接符(可方便使用grep在key文件中按前缀来过滤查询)
+  # 排序完成后再使用awk命令按前缀树状层级展示，然后通过column命令进行表格化对齐
   # 最后使用awk命令来美化TITLE字段以及高亮显示部分层级
   (echo -e "==========,========,========\n KEY_PREFIX,COUNT,PERCENT\n----------,--------,--------"; 
    cat $INPUT_FILE | awk '{print $1}' | awk -v level=$PREFIX_LVL  -F'[_:.$|-]' '
     {   
       count+=1;
       if($0 ~ /^[\x20-\x7E]+$/) {
-        gsub(/[\x30-\x38]/,"9");
+        gsub(/[\x30-\x39]/,"0");
         for ( i = 1; i <= level && NF >=i; i++ ) {
           if (i == 1)
             prefix=$i;
           else 
-            prefix=prefix"0"$i;
+            prefix=prefix"."$i;
           switch(i) {
             case 1:
               x1[prefix]+=1;
@@ -1533,76 +1533,84 @@ function keyfile_stat() {
         for ( value in  x1 ) {
           perc=100*x1[value]/count;
           if(perc>=70) {
-            printf(" %s:,%s,\033[31;4m%.2f%%\033[0m\n", value, x1[value], perc);
+            printf(" %s,%s,\033[31;4m%.2f%%\033[0m,1\n", value, x1[value], perc);
           } else {
-            printf(" %s:,%s,%.2f%%\n", value, x1[value], perc);
+            printf(" %s,%s,%.2f%%,1\n", value, x1[value], perc);
           }
         }
         for ( value in  x2 ) {
           perc=100*x2[value]/count;
           if(perc>=60) {
-            printf("  |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x2[value], perc);
+            printf(" %s,%s,\033[31;4m%.2f%%\033[0m,2\n", value, x2[value], perc);
           } else {
-            printf("  |- %s,%s,%.2f%%\n", value, x2[value], perc);
+            printf(" %s,%s,%.2f%%,2\n", value, x2[value], perc);
           }
         }
         for ( value in  x3 ) {
           perc=100*x3[value]/count;
           if(perc>=50) {
-            printf("      |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x3[value], perc);
+            printf(" %s,%s,\033[31;4m%.2f%%\033[0m,3\n", value, x3[value], perc);
           } else {
-            printf("      |- %s,%s,%.2f%%\n", value, x3[value], perc);
+            printf(" %s,%s,%.2f%%,3\n", value, x3[value], perc);
           }
         }
         for ( value in  x4 ) {
           perc=100*x4[value]/count;
           if(perc>=40) {
-            printf("          |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x4[value], perc);
+            printf(" %s,%s,\033[31;4m%.2f%%\033[0m,4\n", value, x4[value], perc);
           } else {
-            printf("          |- %s,%s,%.2f%%\n", value, x4[value], perc);
+            printf(" %s,%s,%.2f%%,4\n", value, x4[value], perc);
           }
         }
         for ( value in  x5 ) {
           perc=100*x5[value]/count;
           if(perc>=30) {
-            printf("              |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x5[value], perc);
+            printf(" %s,%s,\033[31;4m%.2f%%\033[0m,5\n", value, x5[value], perc);
           } else {
-            printf("              |- %s,%s,%.2f%%\n", value, x5[value], perc);
+            printf(" %s,%s,%.2f%%,5\n", value, x5[value], perc);
           }
         }
         for ( value in  x6 ) {
           perc=100*x6[value]/count;
           if(perc>=20) {
-            printf("                  |- %s,%s,\033[31;4m%.2f%%\033[0m\n", value, x6[value], perc);
+            printf(" %s,%s,\033[31;4m%.2f%%\033[0m,6\n", value, x6[value], perc);
           } else {
-            printf("                  |- %s,%s,%.2f%%\n", value, x6[value], perc);
+            printf(" %s,%s,%.2f%%,6\n", value, x6[value], perc);
           }
         }
-    }' \
-    | sort -t ',' -k1,1 ) \
-    | awk -F',' -v OFS=',' '{gsub(/0/,".",$1);gsub(/9/,"0",$1);print $0}' \
-    | column -t -s ',' -o ' | ' | awk -F'|' '
-        {
-          if(NR==1) {
-            gsub(/[ |]/,"=");
-            len=length($0);
-            print
-          } else if(NR==3) {
-            gsub(/ /,"-");
-            print
-          } else {
-            if(NR==2 || substr($0,1,2)=="  ") {
-              print
-            } else {
-              printf("\033[42;30m%s\033[0m\n",$0)
-            }
-          }
-        } END {
-          for(i=1;i<=len;i++) {
-            printf("=");
-          }
-          printf("\n");
-        }'
+    }' | sort -t ',' -k1,1 | awk -F',' -v OFS=',' '
+    {
+      for(i=$4;i>0;i--) {
+        if(i==1) {
+          printf("%s:,%s,%s\n", $1, $2, $3)
+        } else if(i==2) {
+          printf("  |-")
+        } else {
+          printf("    ")
+        }
+      }
+    }' ) | column -t -s ',' -o ' | ' | awk -F'|' '
+    {
+      if(NR==1) {
+        gsub(/[ |]/,"=");
+        len=length($0);
+        print
+      } else if(NR==3) {
+        gsub(/ /,"-");
+        print
+      } else {
+        if(NR==2 || substr($0,1,2)=="  ") {
+          print
+        } else {
+          printf("\033[42;30m%s\033[0m\n",$0)
+        }
+      }
+    } END {
+      for(i=1;i<=len;i++) {
+        printf("=");
+      }
+      printf("\n");
+    }'
 }
 
 #######################################
@@ -1737,6 +1745,13 @@ function main() {
   # use nawk by default
   if [ -f /usr/bin/nawk ]; then alias awk=nawk ;fi
   shopt -s expand_aliases
+  
+  # sort --help
+  # *** WARNING ***
+  # The locale specified by the environment affects sort order.
+  # Set LC_ALL=C to get the traditional sort order that uses
+  # native byte values.
+  export LC_ALL=C
   
   if [[ $# -eq 0 ]]; then
     echo -e "$USAGE"
