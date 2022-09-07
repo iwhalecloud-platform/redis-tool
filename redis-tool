@@ -876,7 +876,7 @@ function subprocess_monitor_cmds_by_ip() {
   # init result file
   local ret_file="${MONI_PREFIX}${deal_ip}.${MYPID}"
   >$ret_file
-  for node_addr in $(echo "$MASTER_LIST"|grep $deal_ip); do
+  for node_addr in $(echo "$MASTER_LIST"|grep -w $deal_ip); do
     # ADDR
     local node_ip=${node_addr%:*}
     local node_port=${node_addr##*:}
@@ -1374,7 +1374,7 @@ function subprocess_slowlog_by_ip() {
   local prog_file="${NODES_PREFIX}${deal_ip}.${MYPID}"
   >$ret_file
   >$prog_file
-  for node_addr in $(echo "$NODES_LIST"|grep $deal_ip); do
+  for node_addr in $(echo "$NODES_LIST"|grep -w $deal_ip); do
     # ADDR
     local node_ip=${node_addr%:*}
     local node_port=${node_addr##*:}
