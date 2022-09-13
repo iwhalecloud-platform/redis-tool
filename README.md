@@ -80,11 +80,11 @@ command:
 <span style='color:red'>**注意事项**：</span>
 
 1. 请提前设置<span style='color:red'>REDIS_HOME</span>环境变量为redis-cli工具所在目录（如果`PATH`环境变量中包含该目录，可省略）
-2. 强烈建议使用<span style='color:red'>REDISCLI_AUTH</span>环境变量来传入Redis访问密码
+2. 强烈建议使用<span style='color:red'>REDISCLI_AUTH</span>环境变量来传入Redis访问密码，提升安全性
 
 ### Redis集群监控
 
-使用`nodes`子命令可以汇总集群各节点的主要指标信息，并按照主从关系进行级联展示：
+使用`nodes`子命令可以汇总集群各节点的主要指标信息，并按照主从关系进行级联展示（当未指定子命令时，默认执行Redis集群监控子命令）：
 
 ```bash
 $ ./redis-tool -p 6380 nodes
