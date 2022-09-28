@@ -783,7 +783,7 @@ function show_cluster_status() {
           maxnum=mapip[ip];
         }
       }
-      if(minnum != maxnum) {
+      if(minnum != maxnum && maxnum > 1) {
         printf("\033[41;37m!!!!! <WARNING> Masters unbalance on hosts: min/max = %s/%s !!!!!\033[0m\n", minnum,maxnum);
       }
       print "========================================================================================================================="
