@@ -188,9 +188,44 @@ function get_cluster_nodes() {
   local nodes_res=""
   if [[ ${#CLUSTER_NODES_ALL} -eq 0 ]]; then
     nodes_res=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} cluster nodes 2>&1)
-    if [[ $? -eq 0 && "${nodes_res:0:8}" != "LOADING " && "${nodes_res:0:7}" != "NOAUTH " ]]; then
+    if [[ $? -eq 0 && "${nodes_res:0:8}" != "LOADING " && "${nodes_res:0:7}" != "NOAUTH " && "${nodes_res:0:4}" != "ERR " ]]; then
       # 1.masterID 2.role 3.ID 4.ip:port 5.flags 6.masterID 7.pingtime 8.pongtime 9.configepoch 10.connect 11.slots
       CLUSTER_NODES_ALL=$(echo "$nodes_res"|awk '{if($4=="-"){print $1" master "$0}else{print $4" slave "$0}}'|sort)
+    elif [[ "$nodes_res" =~ "cluster support disabled" ]]; then
+      # redis isn't in cluster mode
+      local role_info=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} --raw role 2>&1)
+      local role=$(echo "$role_info"|head -1)
+      if [[ "$role" == "master" || "$role" == "slave" ]]; then
+        local awk_cmd='
+          {
+            idx+=1;
+            if(role==""){
+              role=$1;
+              if(role=="master") {
+                print myaddr,"master",myaddr,myaddr,"master","-","pingtime","pongtime","poch","connected","single-M";
+              }
+            } else if(role=="master") {
+              if(idx>2) {
+                if((idx-3)%3 == 0) {
+                  slaveip=$1
+                } else if((idx-3)%3 == 1) {
+                  slave=slaveip":"$1
+                  print myaddr,"slave",slave,slave,"slave",myaddr,"pingtime","pongtime","poch","connected","single-S" 
+                }
+              }
+            } else if(role=="slave") {
+              if(idx==2) {
+                masterip=$1;
+              } else if(idx==3) {
+                master=masterip":"$1
+                print master,"master",master,master,"master","-","pingtime","pongtime","poch","connected","single-M" 
+                print master,"slave",myaddr,myaddr,"slave",master,"pingtime","pongtime","poch","connected","single-S" 
+              }
+            }
+          }'
+          
+        CLUSTER_NODES_ALL=$(echo "$role_info" | awk -v myaddr=${REDIS_HOST}:${REDIS_PORT} "$awk_cmd")
+      fi
     fi
     if [[ ${#CLUSTER_NODES_ALL} -eq 0 ]]; then
       warn "Access redis(${REDIS_HOST}:${REDIS_PORT}) failed: \033[41;37m${nodes_res}\033[0m"
