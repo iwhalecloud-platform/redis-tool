@@ -433,8 +433,6 @@ $ ./redis-tool -p 6380 config
 
 集群参数查询/修改范围包括三类：所有节点（默认），所有主节点（`-M`），所有从节点（`-S`）
 
-
-
 ```bash
 # 1. 查询集群各节点的slowlog-log-slower-than参数值
 $ ./redis-tool -p 6380 -k slowlog-log-slower-than config
@@ -465,9 +463,26 @@ $ ./redis-tool -p 6380 -k slowlog-log-slower-than -v 100 -M config
 ================================================================================
 ```
 
-
-
 **备注**：使用`-w`参数时，当Redis运行参数修改后，会重写Redis配置文件，这样节点重启后能够继续生效
+
+**密码参数统一修改示例**：
+
+```bash
+# 示例一：无密码集群新增密码：redis
+redis-tool -h 172.16.18.80 -p 6379 -a '' -k masterauth -v 'redis' config
+redis-tool -h 172.16.18.80 -p 6379 -a '' -k requirepass -v 'redis' -w config
+redis-tool -h 172.16.18.80 -p 6379 -a 'redis'
+
+# 示例二：将集群密码redis修改为Red1s@2022
+redis-tool -h 172.16.18.80 -p 6379 -a 'redis' -k masterauth -v 'Red1s@2022' config
+redis-tool -h 172.16.18.80 -p 6379 -a 'redis' -k requirepass -v 'Red1s@2022' -w config
+redis-tool -h 172.16.18.80 -p 6379 -a 'Red1s@2022'
+
+# 示例三：去掉集群密码设置
+redis-tool -h 172.16.18.80 -p 6379 -a 'Red1s@2022' -k masterauth -v '' config
+redis-tool -h 172.16.18.80 -p 6379 -a 'Red1s@2022' -k requirepass -v '' -w config
+redis-tool -h 172.16.18.80 -p 6379
+```
 
 
 
