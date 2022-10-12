@@ -196,6 +196,18 @@ function get_cluster_nodes() {
       local role_info=$(redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ${AUTH} --raw role 2>&1)
       local role=$(echo "$role_info"|head -1)
       if [[ "$role" == "master" || "$role" == "slave" ]]; then
+        # used master role info: 1 master && >=1 slaves
+        if [[ "$role" == "slave" ]]; then
+          local master_ip=$(echo "$role_info"|head -2|tail -1)
+          local master_port=$(echo "$role_info"|head -3|tail -1)
+          local master_role_info=$(redis-cli -h ${master_ip} -p ${master_port} ${AUTH} --raw role 2>&1)
+          local master_role=$(echo "$master_role_info"|head -1)
+          if [[ "$master_role" == "master" ]]; then
+            role_info="$master_role_info"
+            REDIS_HOST=$master_ip
+            REDIS_PORT=$master_port
+          fi
+        fi
         local awk_cmd='
           {
             idx+=1;
