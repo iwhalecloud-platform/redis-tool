@@ -1544,7 +1544,7 @@ function keyfile_stat() {
   # 排序完成后再使用awk命令按前缀树状层级展示，然后通过column命令进行表格化对齐
   # 最后使用awk命令来美化TITLE字段以及高亮显示部分层级
   (echo -e "==========,========,========\n KEY_PREFIX,COUNT,PERCENT\n----------,--------,--------"; 
-   cat $INPUT_FILE | awk '{print $1}' | awk -v level=$PREFIX_LVL  -F'[_:.$|-]' '
+   cat $INPUT_FILE | awk '{print $1}' | awk -v level=$PREFIX_LVL  -F'[/_:.$|-]' '
     {   
       count+=1;
       if($0 ~ /^[\x20-\x7E]+$/) {
