@@ -1227,14 +1227,19 @@ function trace_commands() {
   
   # stat commands every second: order by command name
   local awk_cmd_stat='
+    BEGIN {
+      #PROCINFO["sorted_in"] = "@ind_str_asc"
+      PROCINFO["sorted_in"] = "@val_num_desc"
+    }
     {
       currsec=substr($1,1,10)
       if(currsec!=lastsec) {
-        len=asorti(arr,arrsort);
-        for(j=1;j<=len;j++) {
-          msg=msg" "arrsort[j]":"arr[arrsort[j]];
+        count=0;
+        for(idx in arr) {
+          msg=msg" "idx":"arr[idx];
+          count+=arr[idx];
         }
-        if(msg!="") print strftime("%T", lastsec)">"msg;
+        if(msg!="") print strftime("%T", lastsec)"> "count""msg;
         msg="";
         lastsec=currsec;
         delete arr;
@@ -1243,11 +1248,12 @@ function trace_commands() {
         ++arr[toupper($4)];
       }
     } END {
-      len=asorti(arr,arrsort);
-      for(j=1;j<=len;j++) {
-        msg=msg" "arrsort[j]":"arr[arrsort[j]];
+      count=0;
+      for(idx in arr) {
+        msg=msg" "idx":"arr[idx];
+        count+=arr[idx];
       }
-      print strftime("%T", lastsec)">"msg;
+      print strftime("%T", lastsec)"> "count""msg;
     }'
     
   if [ "${INPUT_FILE}" != "" ]; then
